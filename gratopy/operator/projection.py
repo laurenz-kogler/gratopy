@@ -35,7 +35,6 @@ import numpy.typing as npt
 import pyopencl as cl
 import pyopencl.array as clarray
 
-from copy import copy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -171,9 +170,13 @@ class Radon(_OpenCLOperator):
             "image_domain": image_domain,
             "angles": angles,
             "detectors": detectors,
-            "adjoint": adjoint,
         }
-        super().__init__(name="Radon", state=state, kernel_spec=kernel_spec)
+        super().__init__(
+            name="Radon",
+            state=state,
+            kernel_spec=kernel_spec,
+            adjoint=adjoint,
+        )
 
         self.substitute_placeholder()
         self.projection_settings: SimpleNamespace | None = None
@@ -213,21 +216,6 @@ class Radon(_OpenCLOperator):
     @property
     def detectors(self) -> Detectors:
         return self.state["detectors"]
-
-    @property
-    def adjoint(self) -> bool:
-        return self.state["adjoint"]
-
-    @property
-    def T(self) -> "Radon":
-        operator_copy = copy(self)
-        operator_copy.state = copy(self.state)
-        operator_copy.state["adjoint"] = not self.state["adjoint"]
-        operator_copy.input_shape, operator_copy.output_shape = (
-            operator_copy.output_shape,
-            operator_copy.input_shape,
-        )
-        return operator_copy
 
     def _repr_name_(self) -> str:
         return "Radon.T" if self.adjoint else "Radon"

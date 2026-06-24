@@ -4,7 +4,6 @@ import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
 
-from copy import copy
 from pathlib import Path
 
 from gratopy.operator.opencl import OpenCLKernelSpec, _OpenCLOperator
@@ -21,28 +20,16 @@ class AffineOperator(_OpenCLOperator):
         adjoint: bool = False,
         kernel_spec: OpenCLKernelSpec | None = None,
     ):
-        state = {"adjoint": adjoint}
         super().__init__(
             name="AffineOperator",
-            state=state,
             input_shape=shape,
             output_shape=shape,
+            adjoint=adjoint,
             kernel_spec=kernel_spec,
         )
 
     def _default_kernel_spec(self) -> OpenCLKernelSpec:
         return OpenCLKernelSpec.from_path(TEST_AFFINE_KERNEL, base_name="affine")
-
-    @property
-    def adjoint(self) -> bool:
-        return self.state["adjoint"]
-
-    @property
-    def T(self) -> "AffineOperator":
-        operator_copy = copy(self)
-        operator_copy.state = copy(self.state)
-        operator_copy.state["adjoint"] = not self.state["adjoint"]
-        return operator_copy
 
 
 def test_custom_kernel_spec_end_to_end():

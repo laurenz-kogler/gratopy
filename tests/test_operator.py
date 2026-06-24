@@ -3,7 +3,7 @@ import pytest
 import pyopencl as cl
 import pyopencl.array as clarray
 
-from gratopy.operator.base import IDENTITY, ZERO, Operator
+from gratopy.operator.base import IDENTITY, ZERO, Operator, OperatorArithmeticOperation
 from gratopy.operator import Radon
 from gratopy.utilities import Angles, Detectors, ExtentPlaceholder, ImageDomain
 
@@ -89,6 +89,69 @@ def test_operator_arithmetic_references():
 
     assert 5 * (A + B + A) == 5 * A + 5 * B + 5 * A
     assert 5 * (A * B * B * A) == 5 * A * B * B * A
+
+
+def test_operator_adjoint_swaps_shapes_and_is_involutive():
+    A = Operator(name="A", input_shape=(10,), output_shape=(20,))
+
+    assert A.adjoint is False
+    assert A.T.adjoint is True
+    assert A.T.input_shape == (20,)
+    assert A.T.output_shape == (10,)
+    assert A.T.T == A
+
+
+def test_identity_and_zero_are_self_adjoint():
+    assert IDENTITY.T is IDENTITY
+    assert ZERO.T is ZERO
+
+
+def test_sum_adjoint_is_sum_of_adjoints():
+    A = Operator(name="A", input_shape=(10,), output_shape=(20,))
+    B = Operator(name="B", input_shape=(10,), output_shape=(20,))
+
+    assert (A + B).T == A.T + B.T
+    assert (3 * (A + B)).T == 3 * A.T + 3 * B.T
+
+
+def test_product_adjoint_reverses_order():
+    A = Operator(name="A", input_shape=(20,), output_shape=(30,))
+    B = Operator(name="B", input_shape=(10,), output_shape=(20,))
+
+    assert (A * B).T == B.T * A.T
+    assert (5 * A * B).T == 5 * B.T * A.T
+
+
+def test_nested_composite_adjoint():
+    A = Operator(name="A", input_shape=(20,), output_shape=(30,))
+    B = Operator(name="B", input_shape=(20,), output_shape=(30,))
+    C = Operator(name="C", input_shape=(10,), output_shape=(20,))
+
+    assert ((A + B) * C).T == C.T * (A.T + B.T)
+
+
+def test_radon_adjoint_uses_base_operator_state():
+    R = Radon(image_domain=16, angles=10)
+
+    assert "adjoint" not in R.state
+    assert R.adjoint is False
+    assert R.T.adjoint is True
+    assert R.T.input_shape == R.output_shape
+    assert R.T.output_shape == R.input_shape
+    assert R.T.T.adjoint is False
+    assert R.T.T.input_shape == R.input_shape
+    assert R.T.T.output_shape == R.output_shape
+
+
+def test_radon_composite_adjoint():
+    R = Radon(image_domain=16, angles=10)
+    gram = R.T * R
+    gram_adjoint = gram.T
+
+    assert gram_adjoint._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION
+    assert [operand.adjoint for operand in gram_adjoint._operands] == [True, False]
+    assert gram_adjoint.input_shape == gram.input_shape
+    assert gram_adjoint.output_shape == gram.output_shape
 
 
 def test_radon_integer_angles_use_half_circle_default():

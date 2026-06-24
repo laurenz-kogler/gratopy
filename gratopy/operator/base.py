@@ -74,6 +74,7 @@ class Operator:
         operands: list[Operator] | None = None,
         input_shape: tuple[int, ...] | None = None,
         output_shape: tuple[int, ...] | None = None,
+        adjoint: bool = False,
     ):
         if name is None:
             name = self.__class__.__name__
@@ -93,6 +94,7 @@ class Operator:
 
         self.input_shape = input_shape
         self.output_shape = output_shape
+        self._adjoint = adjoint
 
     def _scalar_repr_(self) -> str:
         scalar_repr = ""
@@ -152,8 +154,46 @@ class Operator:
                 self._operands == other._operands,
                 self.input_shape == other.input_shape,
                 self.output_shape == other.output_shape,
+                self.adjoint == other.adjoint,
             ]
         )
+
+    @property
+    def adjoint(self) -> bool:
+        """Whether this operator represents its adjoint action."""
+        return self._adjoint
+
+    @property
+    def T(self) -> Operator:
+        """Return the adjoint operator.
+
+        Composite adjoints follow the usual algebraic rules:
+        ``(A + B).T = A.T + B.T`` and ``(A * B).T = B.T * A.T``.
+        """
+        if self.is_composite():
+            if self._arithmetic_operation == OperatorArithmeticOperation.ADDITION:
+                adjoint = self._operands[0].T
+                for operand in self._operands[1:]:
+                    adjoint = adjoint + operand.T
+                return np.conjugate(self.scalar) * adjoint
+
+            if self._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION:
+                operands = [operand.T for operand in reversed(self._operands)]
+                adjoint = operands[0]
+                for operand in operands[1:]:
+                    adjoint = adjoint * operand
+                return np.conjugate(self.scalar) * adjoint
+
+            raise ValueError(f"Unknown arithmetic operation: {self._arithmetic_operation}")
+
+        operator_copy = deepcopy(self)
+        operator_copy._adjoint = not self._adjoint
+        operator_copy.scalar = np.conjugate(operator_copy.scalar)
+        operator_copy.input_shape, operator_copy.output_shape = (
+            operator_copy.output_shape,
+            operator_copy.input_shape,
+        )
+        return operator_copy
 
     @property
     def scalar(self) -> Numeric:
@@ -305,6 +345,11 @@ class Operator:
 class _IdentityOperator(Operator):
     """Base class for identity operator."""
 
+    @property
+    def T(self) -> Operator:
+        """The identity operator is self-adjoint."""
+        return self
+
     def __mul__(self, other: Operator | Any) -> Operator | Any:
         """Multiplying the identity operator with another operator returns
         the other operator."""
@@ -323,6 +368,14 @@ class _IdentityOperator(Operator):
 
 class _ZeroOperator(Operator):
     """Base class for zero operator."""
+
+    @property
+    def T(self) -> Operator:
+        """The zero operator is self-adjoint."""
+        # This singleton zero operator is shape-agnostic. If we later introduce
+        # shape-aware zero operators, their adjoints should swap input and
+        # output shapes just like regular operators.
+        return self
 
     def __add__(self, other: Operator) -> Operator:
         """Adding zero operator to any operator returns the other operator."""
