@@ -9,6 +9,7 @@ import time
 import gratopy
 
 from .helpers import evaluate_control_numbers, create_phantoms
+from gratopy.utilities import Detectors, ImageDomain
 
 # Plots are deactivated by default, can be activated
 # by setting 'export GRATOPY_TEST_PLOT=true' in the terminal
@@ -1114,6 +1115,188 @@ def test_angle_input_variants():
                     detector_width=detector_width,
                     detector_shift=0,
                 )
+
+
+def _test_operator_projection(operator_class, name):
+    """
+    Basic projection test for operator API parallel geometry Radon variants. 
+
+    Computes forward and backprojection for two test images and repeats both
+    calls to estimate execution time, mirroring test_projection above.
+    """
+
+    print(name + " projection test")
+
+    ctx = cl.create_some_context(interactive=INTERACTIVE)
+    queue = cl.CommandQueue(ctx)
+
+    dtype = np.dtype("float32")
+    N = 1200
+    img_gpu = create_phantoms(queue, N, dtype=dtype)
+
+    angles = 360
+    detector_width = 4.0
+    image_width = 4.0
+    Ns = int(0.5 * N)
+
+    projection = operator_class(
+        image_domain=ImageDomain(size=(N, N), extent=image_width),
+        angles=angles,
+        detectors=Detectors(number=Ns, extent=detector_width),
+    )
+    backprojection = projection.T
+
+    sino_gpu = clarray.zeros(
+        queue, projection.output_shape + (2,), dtype=dtype, order="F"
+    )
+    backprojected_gpu = clarray.zeros(
+        queue, projection.input_shape + (2,), dtype=dtype, order="F"
+    )
+
+    M = 10
+    a = time.perf_counter()
+    for i in range(M):
+        projection.apply_to(img_gpu, output=sino_gpu)
+    sino_gpu.get()
+    print(
+        "Average time required for "
+        + name
+        + " forward projection "
+        + str((time.perf_counter() - a) / M)
+    )
+
+    a = time.perf_counter()
+    for i in range(M):
+        backprojection.apply_to(sino_gpu, output=backprojected_gpu)
+    backprojected_gpu.get()
+    print(
+        "Average time required for "
+        + name
+        + " backprojection "
+        + str((time.perf_counter() - a) / M)
+    )
+
+    img = img_gpu.get()
+    sino = sino_gpu.get()
+    backprojected = backprojected_gpu.get()
+
+    if PLOT:
+        plt.figure()
+        plt.imshow(np.hstack([img[:, :, 0], img[:, :, 1]]), cmap=plt.cm.gray)
+        plt.title(name + " original image")
+        plt.figure()
+        plt.imshow(np.hstack([sino[:, :, 0], sino[:, :, 1]]), cmap=plt.cm.gray)
+        plt.title(name + " sinogram")
+        plt.figure()
+        plt.imshow(
+            np.hstack([backprojected[:, :, 0], backprojected[:, :, 1]]),
+            cmap=plt.cm.gray,
+        )
+        plt.title(name + " backprojected image")
+        plt.show()
+
+    evaluate_control_numbers(
+        img,
+        (N, N, Ns, angles, 2),
+        expected_result=2949.3738,
+        classified="img",
+        name=name + " original image",
+    )
+
+    assert np.all(np.isfinite(sino))
+    assert np.linalg.norm(sino) > 0
+    assert np.all(np.isfinite(backprojected))
+    assert np.linalg.norm(backprojected) > 0
+
+
+def test_projection_ray():
+    _test_operator_projection(gratopy.operator.RayDrivenRadon, "ray-driven Radon")
+
+
+def test_projection_strip():
+    _test_operator_projection(gratopy.operator.StripDrivenRadon, "strip-driven Radon")
+
+
+def _test_operator_adjointness(operator_class, name):
+    """Adjointness test for operator API Radon variants."""
+
+    print(name + " adjointness test")
+
+    ctx = cl.create_some_context(interactive=INTERACTIVE)
+    queue = cl.CommandQueue(ctx)
+
+    dtype = np.dtype("float32")
+    order = "F"
+
+    Nx = 400
+    number_detectors = 230
+    angles = 180
+    img_shape = (Nx, Nx)
+
+    PS = gratopy.ProjectionSettings(
+        queue, gratopy.PARALLEL, img_shape, angles, n_detectors=number_detectors
+    )
+    projection = operator_class(
+        image_domain=ImageDomain(size=img_shape, extent=PS.image_width),
+        angles=angles,
+        detectors=Detectors(number=number_detectors, extent=PS.detector_width),
+    )
+    backprojection = projection.T
+
+    sino2_gpu = clarray.zeros(queue, projection.output_shape, dtype=dtype, order=order)
+    img2_gpu = clarray.zeros(queue, projection.input_shape, dtype=dtype, order=order)
+
+    Error = []
+    count = 0
+    eps = 0.00001
+
+    for i in range(100):
+        img1_gpu = clarray.to_device(
+            queue, np.require(np.random.random(projection.input_shape), dtype, order)
+        )
+        sino1_gpu = clarray.to_device(
+            queue, np.require(np.random.random(projection.output_shape), dtype, order)
+        )
+
+        projection.apply_to(img1_gpu, output=sino2_gpu)
+        backprojection.apply_to(sino1_gpu, output=img2_gpu)
+
+        pairing_img = clarray.vdot(img1_gpu, img2_gpu).get() * PS.delta_x**2
+        pairing_sino = (
+            clarray.vdot(gratopy.weight_sinogram(sino1_gpu, PS), sino2_gpu).get()
+            * PS.delta_s
+        )
+
+        relative_error = abs(pairing_img - pairing_sino) / min(
+            abs(pairing_img), abs(pairing_sino)
+        )
+        if relative_error > eps:
+            count += 1
+            Error.append((pairing_img, pairing_sino))
+
+    print(
+        name
+        + " adjointness: Number of Errors: "
+        + str(count)
+        + " out of 100 tests adjointness-errors were bigger than "
+        + str(eps)
+    )
+    assert len(Error) < 10, (
+        "A large number of "
+        + name
+        + " experiments for adjointness turned out negative, number of errors: "
+        + str(count)
+        + " out of 100 tests adjointness-errors were bigger than "
+        + str(eps)
+    )
+
+
+def test_adjointness_ray():
+    _test_operator_adjointness(gratopy.operator.RayDrivenRadon, "ray-driven Radon")
+
+
+def test_adjointness_strip():
+    _test_operator_adjointness(gratopy.operator.StripDrivenRadon, "strip-driven Radon")
 
 
 # test

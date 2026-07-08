@@ -40,8 +40,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from gratopy.gratopy import radon_struct
-from gratopy.operator.base import Operator
+from gratopy.gratopy import fanbeam_struct, radon_struct
 from gratopy.operator.opencl import OpenCLKernelSpec, _OpenCLOperator
 from gratopy.utilities import (
     Angles,
@@ -57,7 +56,6 @@ from gratopy.utilities import (
     valid_image_given_detector_fullcircle,
     valid_image_given_detector_halfcircle,
 )
-
 
 class Radon(_OpenCLOperator):
     """Parallel-beam Radon transform operator.
@@ -444,7 +442,10 @@ class Radon(_OpenCLOperator):
         )
 
 
-class Fanbeam(Operator):
+"""Fanbeam-beam Radon transform operator.
+    -without the substitute placeholder-"""
+
+class Fanbeam(_OpenCLOperator):
     def __init__(
         self,
         source_distances: float | tuple[float, float],
@@ -452,8 +453,265 @@ class Fanbeam(Operator):
         angles: Angles | int,
         detectors: Detectors | int | None = None,
         adjoint: bool = False,
+        kernel_spec: OpenCLKernelSpec | None = None,
     ):
-        super().__init__(name="Fanbeam")
+        if not isinstance(image_domain, ImageDomain):
+            image_domain = ImageDomain(size=image_domain, extent=2.0)
+
+        if not isinstance(angles, Angles):
+            angles = Angles.uniform(number=angles)
+
+        if not isinstance(detectors, Detectors):
+            if detectors is None:
+                detectors = int(np.ceil(np.hypot(*image_domain.size)))
+            detector_extent = image_domain.extent
+            if isinstance(detector_extent, ExtentPlaceholder):
+                detector_extent = ExtentPlaceholder.FULL
+            detectors = Detectors(number=detectors, extent=detector_extent)
+    
+        if isinstance(source_distances, tuple):
+            source_detector_distance, source_origin_distance = source_distances
+        else:
+            source_detector_distance = source_distances
+            source_origin_distance = source_distances / 2
+
+        state = {
+            "source_detector_distance": source_detector_distance,
+            "source_origin_distance": source_origin_distance,
+            "image_domain": image_domain,
+            "angles": angles,
+            "detectors": detectors,
+            "adjoint": adjoint,
+        }
+        super().__init__(name="Fanbeam", state=state, kernel_spec=kernel_spec)
+
+        self.substitute_placeholder()
+        self.projection_settings: SimpleNamespace | None = None
+        self._host_struct: dict[str, Any] | None = None
+        self._device_struct: dict[tuple[cl.Context, np.dtype], dict[str, Any]] = {}
+
+        image_shape = self.image_domain.size
+        sinogram_shape = (self.detectors.number, len(self.angles))
+
+        if self.adjoint:
+            self.input_shape = sinogram_shape
+            self.output_shape = image_shape
+        else:
+            self.input_shape = image_shape
+            self.output_shape = sinogram_shape
+
+    def _default_kernel_spec(self) -> OpenCLKernelSpec:
+        kernel_path = Path(__file__).resolve().parent.parent / "fanbeam.cl"
+        return OpenCLKernelSpec.from_path(kernel_path, base_name="fanbeam")
+    
+    def __getstate__(self) -> dict[str, Any]:
+        """Return pickle/deepcopy state without live OpenCL runtime objects."""
+        state = super().__getstate__()
+        state["projection_settings"] = None
+        state["_host_struct"] = None
+        state["_device_struct"] = {}
+        return state
+
+    @property
+    def source_detector_distance(self) -> float:
+        return self.state["source_detector_distance"]
+
+    @property
+    def source_origin_distance(self) -> float:
+        return self.state["source_origin_distance"]
+
+    @property
+    def image_domain(self) -> ImageDomain:
+        return self.state["image_domain"]
+
+    @property
+    def angles(self) -> Angles:
+        return self.state["angles"]
+
+    @property
+    def detectors(self) -> Detectors:
+        return self.state["detectors"]
+
+    @property
+    def adjoint(self) -> bool:
+        return self.state["adjoint"]
+
+    @property
+    def T(self) -> "Fanbeam":
+        operator_copy = copy(self)
+        operator_copy.state = copy(self.state)
+        operator_copy.state["adjoint"] = not self.state["adjoint"]
+        operator_copy.input_shape, operator_copy.output_shape = (
+            operator_copy.output_shape,
+            operator_copy.input_shape,
+        )
+        return operator_copy
+
+    def _repr_name_(self) -> str:
+        return "Fanbeam.T" if self.adjoint else "Fanbeam"
+
+    def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
+        if self._host_struct is not None:
+            return
+
+        self._host_struct = fanbeam_struct(
+            queue=queue,
+            img_shape=self.image_domain.size,
+            angles=self.angles.angles,
+            detector_width=float(self.detectors.extent),
+            source_detector_dist=float(self.source_detector_distance),
+            source_origin_dist=float(self.source_origin_distance),
+            angle_weights=self.angles.weights,
+            n_detectors=self.detectors.number,
+            detector_shift=self.detectors.center,
+            image_width=float(self.image_domain.extent),
+            midpoint_shift=self.image_domain.center,
+            reverse_detector=self.detectors.reversed,
+        )
+
+    def _ensure_device_struct(
+        self,
+        queue: cl.CommandQueue,
+        dtype: npt.DTypeLike,
+    ) -> dict[str, Any]:
+        self._ensure_host_struct(queue)
+        dtype = np.dtype(dtype)
+        cache_key = (queue.context, dtype)
+        if cache_key in self._device_struct:
+            return self._device_struct[cache_key]
+
+        assert self._host_struct is not None
+        ofs = self._host_struct["ofs_dict"][dtype]
+        sdpd = self._host_struct["sdpd_dict"][dtype]
+        geometry = self._host_struct["geo_dict"][dtype]
+        angle_weights = self._host_struct["angle_diff_dict"][dtype]
+
+        ofs_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, ofs.nbytes)
+        sdpd_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, sdpd.nbytes)
+        geometry_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, geometry.nbytes)
+        angle_weights_buf = cl.Buffer(
+            queue.context,
+            cl.mem_flags.READ_ONLY,
+            angle_weights.nbytes,
+        )
+
+        cl.enqueue_copy(queue, ofs_buf, ofs.data).wait()
+        cl.enqueue_copy(queue, sdpd_buf, sdpd.data).wait()
+        cl.enqueue_copy(queue, geometry_buf, geometry.data).wait()
+        cl.enqueue_copy(queue, angle_weights_buf, angle_weights.data).wait()
+
+        device_struct = {
+            "ofs": ofs_buf,
+            "sdpd": sdpd_buf,
+            "geometry": geometry_buf,
+            "angle_weights": angle_weights_buf,
+        }
+        self._device_struct[cache_key] = device_struct
+        return device_struct
+
+    def _kernel_arguments(
+        self,
+        output: clarray.Array,
+        argument: clarray.Array,
+        queue: cl.CommandQueue,
+    ) -> tuple[Any, ...]:
+        device_struct = self._ensure_device_struct(queue, argument.dtype)
+        return device_struct["ofs"], device_struct["sdpd"], device_struct["geometry"]
+
+    def apply_to(
+        self,
+        argument: npt.ArrayLike | clarray.Array,
+        output: clarray.Array | None = None,
+        queue: cl.CommandQueue | None = None,
+        return_event: bool = False,
+    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
+        queue = self._infer_queue(argument=argument, output=output, queue=queue)
+        self.projection_settings = SimpleNamespace(queue=queue)
+        return super().apply_to(
+            argument,
+            output=output,
+            queue=queue,
+            return_event=return_event,
+        )
+
+
+"""Derived operators: ray-driven Radon and Fanbeam and strip Radon"""
+
+class RayDrivenRadon(Radon):
+    """Ray-driven Radon transform operator."""
+
+    def __init__(
+        self,
+        image_domain: int | tuple[int, int] | ImageDomain,
+        angles: Angles | int,
+        detectors: Detectors | int | None = None,
+        adjoint: bool = False,
+        kernel_spec: OpenCLKernelSpec | None = None,
+    ):
+        super().__init__(
+            image_domain=image_domain,
+            angles=angles,
+            detectors=detectors,
+            adjoint=adjoint,
+            kernel_spec=kernel_spec,
+        )
+        self.name = "RayDrivenRadon"
+
+    def _default_kernel_spec(self) -> OpenCLKernelSpec:
+        kernel_path = Path(__file__).resolve().parent.parent / "radon.cl"
+        return OpenCLKernelSpec.from_path(kernel_path, base_name="radon_ray")
+
+
+class RayDrivenFanbeam(Fanbeam):
+    """Ray-driven fanbeam transform operator."""
+
+    def __init__(
+        self,
+        source_distances: float | tuple[float, float],
+        image_domain: int | tuple[int, int] | ImageDomain,
+        angles: Angles | int,
+        detectors: Detectors | int | None = None,
+        adjoint: bool = False,
+        kernel_spec: OpenCLKernelSpec | None = None,
+    ):
+        super().__init__(
+            source_distances=source_distances,
+            image_domain=image_domain,
+            angles=angles,
+            detectors=detectors,
+            adjoint=adjoint,
+            kernel_spec=kernel_spec,
+        )
+        self.name = "RayDrivenFanbeam"
+
+    def _default_kernel_spec(self) -> OpenCLKernelSpec:
+        kernel_path = Path(__file__).resolve().parent.parent / "fanbeam.cl"
+        return OpenCLKernelSpec.from_path(kernel_path, base_name="fanbeam_ray")
+
+
+class StripDrivenRadon(Radon):
+    """Strip-driven parallel-beam Radon transform operator."""
+
+    def __init__(
+        self,
+        image_domain: int | tuple[int, int] | ImageDomain,
+        angles: Angles | int,
+        detectors: Detectors | int | None = None,
+        adjoint: bool = False,
+        kernel_spec: OpenCLKernelSpec | None = None,
+    ):
+        super().__init__(
+            image_domain=image_domain,
+            angles=angles,
+            detectors=detectors,
+            adjoint=adjoint,
+            kernel_spec=kernel_spec,
+        )
+        self.name = "StripDrivenRadon"
+
+    def _default_kernel_spec(self) -> OpenCLKernelSpec:
+        kernel_path = Path(__file__).resolve().parent.parent / "radon.cl"
+        return OpenCLKernelSpec.from_path(kernel_path, base_name="radon_strip")
 
 
 # R, R_E parameters for fanbeam tranform: pass as _one_ argument, tuple
