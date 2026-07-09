@@ -550,6 +550,15 @@ class Fanbeam(_OpenCLOperator):
     def _repr_name_(self) -> str:
         return "Fanbeam.T" if self.adjoint else "Fanbeam"
 
+    def substitute_placeholder(self) -> None:
+        """(NOT IMPLEMENTED)"""
+        if isinstance(self.image_domain.extent, ExtentPlaceholder) or isinstance(
+            self.detectors.extent, ExtentPlaceholder
+        ):
+            raise NotImplementedError(
+                " not implemented"
+            )
+
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         if self._host_struct is not None:
             return

@@ -12,6 +12,7 @@ import gratopy
 from pathlib import Path
 
 from .helpers import evaluate_control_numbers, create_phantoms
+from gratopy.utilities import Detectors, ImageDomain
 
 
 # Plots are deactivated by default, can be activated
@@ -1578,6 +1579,216 @@ def test_create_sparse_matrix(dtype):
         name="backprojected image",
     )
 
+# New operator basic tests written generally since fanbeam strip driven might be added in the future
+
+def _test_operator_projection(operator_class, name):
+    """
+    Basic projection test for operator API fanbeam geometry variants.
+
+    Computes forward and backprojection for two test images and repeats both
+    calls to estimate execution time, mirroring test_projection above.
+    """
+
+    print(name + " projection test")
+
+    ctx = cl.create_some_context(interactive=INTERACTIVE)
+    queue = cl.CommandQueue(ctx)
+
+    dtype = np.dtype("float32")
+    N = 1200
+    img_gpu = create_phantoms(queue, N, dtype=dtype)
+
+    angles = 360
+    number_detectors = 600
+    detector_width = 400.0
+    source_detector_distance = 752.0
+    source_origin_distance = 200.0
+
+    PS = gratopy.ProjectionSettings(
+        queue,
+        gratopy.FANBEAM,
+        img_shape=img_gpu.shape,
+        angles=angles,
+        detector_width=detector_width,
+        RE=source_origin_distance,
+        R=source_detector_distance,
+        n_detectors=number_detectors,
+    )
+    projection = operator_class(
+        source_distances=(source_detector_distance, source_origin_distance),
+        image_domain=ImageDomain(size=(N, N), extent=PS.image_width),
+        angles=angles,
+        detectors=Detectors(number=number_detectors, extent=detector_width),
+    )
+    backprojection = projection.T
+
+    sino_gpu = clarray.zeros(
+        queue, projection.output_shape + (2,), dtype=dtype, order="F"
+    )
+    backprojected_gpu = clarray.zeros(
+        queue, projection.input_shape + (2,), dtype=dtype, order="F"
+    )
+
+    iterations = 10
+    a = time.perf_counter()
+    for i in range(iterations):
+        projection.apply_to(img_gpu, output=sino_gpu)
+    sino_gpu.get()
+    print(
+        "Average time required for "
+        + name
+        + " forward projection "
+        + f"{(time.perf_counter() - a) / iterations:.3f}"
+    )
+
+    a = time.perf_counter()
+    for i in range(iterations):
+        backprojection.apply_to(sino_gpu, output=backprojected_gpu)
+    backprojected_gpu.get()
+    print(
+        "Average time required for "
+        + name
+        + " backprojection "
+        + f"{(time.perf_counter() - a) / iterations:.3f}"
+    )
+
+    img = img_gpu.get()
+    sino = sino_gpu.get()
+    backprojected = backprojected_gpu.get()
+
+    if PLOT:
+        plt.figure()
+        plt.imshow(np.hstack([img[:, :, 0], img[:, :, 1]]), cmap=plt.cm.gray)
+        plt.title(name + " original image")
+        plt.figure()
+        plt.imshow(np.hstack([sino[:, :, 0], sino[:, :, 1]]), cmap=plt.cm.gray)
+        plt.title(name + " sinogram")
+        plt.figure()
+        plt.imshow(
+            np.hstack([backprojected[:, :, 0], backprojected[:, :, 1]]),
+            cmap=plt.cm.gray,
+        )
+        plt.title(name + " backprojected image")
+        plt.show()
+
+    evaluate_control_numbers(
+        img,
+        (N, N, number_detectors, angles, 2),
+        expected_result=2949.3738,
+        classified="img",
+        name=name + " original image",
+    )
+
+    assert np.all(np.isfinite(sino))
+    assert np.linalg.norm(sino) > 0
+    assert np.all(np.isfinite(backprojected))
+    assert np.linalg.norm(backprojected) > 0
+
+
+def test_projection_ray():
+    _test_operator_projection(
+        gratopy.operator.RayDrivenFanbeam, "ray-driven Fanbeam"
+    )
+
+
+def _test_operator_adjointness(operator_class, name):
+    """Adjointness test for operator API fanbeam derived fanbeam geometry variants."""
+
+    print(name + " adjointness test")
+
+    ctx = cl.create_some_context(interactive=INTERACTIVE)
+    queue = cl.CommandQueue(ctx)
+
+    dtype = np.dtype("float32")
+    order = "F"
+
+    Nx = 400
+    number_detectors = 230
+    angles = 360
+    img_shape = (Nx, Nx)
+    detector_width = 83.0
+    detector_shift = 0.0
+    midpoint_shift = [0.0, 0.0]
+    source_detector_distance = 900.0
+    source_origin_distance = 300.0
+
+    PS = gratopy.ProjectionSettings(
+        queue,
+        gratopy.FANBEAM,
+        img_shape,
+        angles,
+        n_detectors=number_detectors,
+        detector_width=detector_width,
+        detector_shift=detector_shift,
+        midpoint_shift=midpoint_shift,
+        R=source_detector_distance,
+        RE=source_origin_distance,
+        image_width=None,
+    )
+    projection = operator_class(
+        source_distances=(source_detector_distance, source_origin_distance),
+        image_domain=ImageDomain(size=img_shape, extent=PS.image_width),
+        angles=angles,
+        detectors=Detectors(
+            number=number_detectors,
+            extent=detector_width,
+            center=detector_shift,
+        ),
+    )
+    backprojection = projection.T
+
+    sino2_gpu = clarray.zeros(queue, projection.output_shape, dtype=dtype, order=order)
+    img2_gpu = clarray.zeros(queue, projection.input_shape, dtype=dtype, order=order)
+
+    Error = []
+    count = 0
+    eps = 0.00001
+
+    for i in range(100):
+        img1_gpu = clarray.to_device(
+            queue, np.require(np.random.random(projection.input_shape), dtype, order)
+        )
+        sino1_gpu = clarray.to_device(
+            queue, np.require(np.random.random(projection.output_shape), dtype, order)
+        )
+
+        projection.apply_to(img1_gpu, output=sino2_gpu)
+        backprojection.apply_to(sino1_gpu, output=img2_gpu)
+
+        pairing_img = clarray.vdot(img1_gpu, img2_gpu).get() * PS.delta_x**2
+        pairing_sino = (
+            clarray.vdot(gratopy.weight_sinogram(sino1_gpu, PS), sino2_gpu).get()
+            * PS.delta_s
+        )
+
+        relative_error = abs(pairing_img - pairing_sino) / min(
+            abs(pairing_img), abs(pairing_sino)
+        )
+        if relative_error > eps:
+            count += 1
+            Error.append((pairing_img, pairing_sino))
+
+    print(
+        name
+        + " adjointness: Number of Errors: "
+        + str(count)
+        + " out of 100 tests adjointness-errors were bigger than "
+        + str(eps)
+    )
+    assert len(Error) < 10, (
+        "A large number of "
+        + name
+        + " experiments for adjointness turned out negative, number of errors: "
+        + str(count)
+        + " out of 100 tests adjointness-errors were bigger than "
+        + str(eps)
+    )
+
+
+def test_adjointness_ray():
+    _test_operator_adjointness(
+        gratopy.operator.RayDrivenFanbeam, "ray-driven Fanbeam"
+    )
 
 
 
