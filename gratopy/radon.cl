@@ -571,7 +571,7 @@ __kernel void radon_ray_ad_\my_variable_type_\order1\order2(
     s_high=min(s_high,Ns-1);
   
 	real acc_local=0;
-	for (int p=s_low;p<s_high;p++)
+	for (int p=s_low;p<=s_high;p++)
 	{
 		real zz = s-p;
 		real weight = ray_weightfkt_\my_variable_type_\order1\order2(zz,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference);
@@ -889,5 +889,4 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
   // the diagonal Nx==Ns.
   img[pos_img_\order1(x, y, z, Nx, Ny, Nz)] = acc;
 }
-
 
