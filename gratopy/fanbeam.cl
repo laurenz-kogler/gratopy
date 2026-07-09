@@ -567,8 +567,8 @@ __kernel void single_line_fanbeam_\my_variable_type_\order1\order2(
       acc * sdpd[s] / delta_xi * delta_x;
 }
 
-// Helper function for ray-driven transforms
-real ray_weightfkt_\my_variable_type_\order1\order2(real t,real kappa,
+// Helper function for ray-driven fanbeam transforms
+real fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(real t,real kappa,
     real s_under,real s_upper,real difference){
   
   real rhs=0;
@@ -739,7 +739,7 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
 		  real zz = (x-midpoint.x) * ortho.x *delta_x + d;
 
 		  real weight=0;
-		  weight = ray_weightfkt_\my_variable_type_\order1\order2(zz,1/fabs(ortho.x),s_under,s_upper,difference);
+		  weight = fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(zz,1/fabs(ortho.x),s_under,s_upper,difference);
 		  
 		  if (weight > (real)0.) {
 			acc += weight * img[0];
@@ -805,6 +805,7 @@ __kernel void fanbeam_ray_ad_\my_variable_type_\order1\order2(
   // Relevant distances
   real R = Geometryinformation[0];
   real delta_xi = Geometryinformation[2];
+  real delta_x = Geometryinformation[10];
 
   // Pixel center relative to the image midpoint
   real2 P = (real2)(xx,yy) - midpoint;
@@ -835,7 +836,7 @@ __kernel void fanbeam_ray_ad_\my_variable_type_\order1\order2(
     real Delta_Phi = o.s6;
 
     real2 dd = (d0 - q) * R_sqr_inv;
-    d = dl*delta_xi_sqr_inv;
+    real2 d = dl * delta_xi_sqr_inv;
 
     // define the corners
     real2 Pmm = P + (real2)(-(real)0.5, -(real)0.5);
@@ -873,7 +874,7 @@ __kernel void fanbeam_ray_ad_\my_variable_type_\order1\order2(
       real difference = s_upper - s_under;
 
       real zz = dot(P - q, ortho) * delta_x;
-      real weight = ray_weightfkt_\my_variable_type_\order1\order2(
+      real weight = fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(
           zz, (real)1. / max(abs_ortho_x, abs_ortho_y), s_under, s_upper,
           difference);
 
@@ -887,5 +888,4 @@ __kernel void fanbeam_ray_ad_\my_variable_type_\order1\order2(
   //update img with computed value
   img[pos_img_\order1(xx, yy, z, Nx, Ny, Nz)] = acc * delta_xi;
 }
-
 
