@@ -47,9 +47,13 @@ from gratopy.utilities import (
     Detectors,
     ExtentPlaceholder,
     ImageDomain,
+    full_detector_given_image_fullcircle,
     full_detector_given_image_halfcircle,
+    full_image_given_detector_fullcircle,
     full_image_given_detector_halfcircle,
+    valid_detector_given_image_fullcircle,
     valid_detector_given_image_halfcircle,
+    valid_image_given_detector_fullcircle,
     valid_image_given_detector_halfcircle,
 )
 
@@ -220,6 +224,36 @@ class Radon(_OpenCLOperator):
     def _repr_name_(self) -> str:
         return "Radon.T" if self.adjoint else "Radon"
 
+    def _use_full_circle(self) -> bool:
+        """Decide whether extent placeholders use full-circle geometry.
+
+        The choice follows the angular sampling's ``half_circle`` flag. That
+        flag is load-bearing only for the equispaced constructors
+        (:meth:`Angles.sparse` / :meth:`Angles.uniform`); for limited-angle and
+        explicit samplings it is plain metadata defaulting to ``False``. So a
+        placeholder resolved on a sampling that was never explicitly flagged
+        could silently fall back to the full-circle formulas. Guard against
+        that: a full-circle resolution is only trusted when the sampled angles
+        actually cover more than half a circle.
+        """
+        if self.angles.half_circle:
+            return False
+
+        angles = np.asarray(self.angles.angles, dtype=float)
+        angular_range = float(angles.max() - angles.min())
+        # POLICY (review): "covers the full circle" == angular range > pi.
+        # This cleanly separates half-circle data (range < pi) from full-circle
+        # data (range ~= 2*pi); a partial scan in between is treated as full.
+        if angular_range <= np.pi + 1e-9:
+            raise ValueError(
+                "Cannot resolve an ExtentPlaceholder: the angular sampling is "
+                "marked half_circle=False (full circle), but the angles only "
+                f"span {angular_range:.4f} rad (<= pi). If this is half-circle "
+                "data, build the Angles with half_circle=True; if it is a "
+                "genuine full-circle scan, widen the angular range."
+            )
+        return True
+
     def substitute_placeholder(self) -> None:
         """Resolve extent placeholders to concrete numeric values."""
         if isinstance(self.image_domain.extent, ExtentPlaceholder) and isinstance(
@@ -239,11 +273,18 @@ class Radon(_OpenCLOperator):
             c = Nx / Ny
             Dd = float(self.detectors.extent)
             M = (Md, Mx, My)
+            full_circle = self._use_full_circle()
 
             if self.image_domain.extent == ExtentPlaceholder.FULL:
-                result = full_image_given_detector_halfcircle(M, Dd, c)
+                if full_circle:
+                    result = full_image_given_detector_fullcircle(M, Dd, c)
+                else:
+                    result = full_image_given_detector_halfcircle(M, Dd, c)
             else:
-                result = valid_image_given_detector_halfcircle(M, Dd, c)
+                if full_circle:
+                    result = valid_image_given_detector_fullcircle(M, Dd, c)
+                else:
+                    result = valid_image_given_detector_halfcircle(M, Dd, c)
 
             if result is None:
                 if self.image_domain.extent == ExtentPlaceholder.FULL:
@@ -277,11 +318,18 @@ class Radon(_OpenCLOperator):
             Dy = extent * Ny / max(Nx, Ny)
             M = (Md, Mx, My)
             D = (Dx, Dy)
+            full_circle = self._use_full_circle()
 
             if self.detectors.extent == ExtentPlaceholder.FULL:
-                result = full_detector_given_image_halfcircle(M, D)
+                if full_circle:
+                    result = full_detector_given_image_fullcircle(M, D)
+                else:
+                    result = full_detector_given_image_halfcircle(M, D)
             else:
-                result = valid_detector_given_image_halfcircle(M, D)
+                if full_circle:
+                    result = valid_detector_given_image_fullcircle(M, D)
+                else:
+                    result = valid_detector_given_image_halfcircle(M, D)
 
             if result is None:
                 if self.detectors.extent == ExtentPlaceholder.FULL:

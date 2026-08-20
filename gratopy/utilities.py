@@ -578,3 +578,155 @@ def valid_detector_given_image_halfcircle(
     if Dd <= 0:
         return None
     return Dd
+
+
+# ---------------------------------------------------------------------------
+# Full-circle variants (phi in [0, 2*pi]).
+#
+# Over the full circle, max_phi s(x, y, phi) = +sqrt(x^2 + y^2) and
+# min_phi s(x, y, phi) = -sqrt(x^2 + y^2) for every point, with no case
+# distinction.  This removes the corner/branch bookkeeping of the half-circle
+# formulas and, crucially, makes the detector offset enter only through
+# abs(Md): the detector-axis sign convention that affects the half-circle
+# variants is irrelevant here.
+# ---------------------------------------------------------------------------
+
+
+def full_detector_given_image_fullcircle(
+    M: tuple[float, float, float],
+    D: tuple[float, float],
+) -> float:
+    """Smallest detector width so every ray through the image hits the detector.
+
+    Full-circle variant (phi in [0, 2*pi]).  See PDF Section 4.1.
+
+    Parameters
+    ----------
+    M : (Md, Mx, My)
+        Detector center offset and image center coordinates.
+    D : (Dx, Dy)
+        Physical image dimensions.
+
+    Returns
+    -------
+    float
+        Required detector width Dd.
+    """
+    (Md, Mx, My) = M
+    (Dx, Dy) = D
+    # No coordinate rotation is needed (unlike the half-circle variant):
+    # over the full circle the extremal projection is +/- the corner radius.
+    MAX = np.sqrt((abs(Mx) + Dx / 2) ** 2 + (abs(My) + Dy / 2) ** 2)
+    Dd = 2 * (MAX + abs(Md))
+    return Dd
+
+
+def full_image_given_detector_fullcircle(
+    M: tuple[float, float, float],
+    Dd: float,
+    c: float = 1.0,
+) -> tuple[float, float] | None:
+    """Largest image so every ray through it hits the detector.
+
+    Full-circle variant (phi in [0, 2*pi]).  See PDF Section 4.2.
+
+    The constraint sqrt((|Mx| + Dx/2)^2 + (|My| + Dy/(2c))^2) <= Dd/2 - |Md|
+    reduces to a single quadratic in Dx (with Dy = Dx / c).
+
+    Parameters
+    ----------
+    M : (Md, Mx, My)
+        Detector center offset and image center coordinates.
+    Dd : float
+        Detector width.
+    c : float
+        Aspect ratio Dx / Dy.
+
+    Returns
+    -------
+    tuple[float, float] or None
+        Image dimensions (Dx, Dy), or None if no valid geometry exists.
+    """
+    (Md, Mx, My) = M
+
+    radius = Dd / 2 - abs(Md)
+    if radius <= 0:
+        return None
+
+    a = (1 + c**2) / (4 * c**2)
+    b = abs(Mx) + abs(My) / c
+    d = Mx**2 + My**2 - radius**2
+
+    # The larger root is the largest feasible Dx; _solve_quadratic returns
+    # (nan, nan) when no real root exists, which the guard below rejects.
+    (_, Dx) = _solve_quadratic(a, b, d)
+    if not np.isfinite(Dx) or Dx <= 0:
+        return None
+
+    Dy = Dx / c
+    return (Dx, Dy)
+
+
+def valid_image_given_detector_fullcircle(
+    M: tuple[float, float, float],
+    Dd: float,
+    c: float = 1.0,
+) -> tuple[float, float]:
+    """Smallest image so every ray hitting the detector passes through it.
+
+    Full-circle variant (phi in [0, 2*pi]).  See PDF Section 4.3.
+
+    Parameters
+    ----------
+    M : (Md, Mx, My)
+        Detector center offset and image center coordinates.
+    Dd : float
+        Detector width.
+    c : float
+        Aspect ratio Dx / Dy.
+
+    Returns
+    -------
+    tuple[float, float]
+        Image dimensions (Dx, Dy).
+    """
+    (Md, Mx, My) = M
+
+    Dx = 2 * (abs(Mx) + abs(Md) + Dd / 2)
+    Dy = 2 * (abs(My) + abs(Md) + Dd / 2)
+
+    Dx = max(Dx, c * Dy)
+    Dy = Dx / c
+    return (Dx, Dy)
+
+
+def valid_detector_given_image_fullcircle(
+    M: tuple[float, float, float],
+    D: tuple[float, float],
+) -> float | None:
+    """Largest detector so every ray hitting it passes through the image.
+
+    Full-circle variant (phi in [0, 2*pi]).  See PDF Section 4.4.
+
+    Parameters
+    ----------
+    M : (Md, Mx, My)
+        Detector center offset and image center coordinates.
+    D : (Dx, Dy)
+        Physical image dimensions.
+
+    Returns
+    -------
+    float or None
+        Detector width Dd, or None if no valid geometry exists.
+    """
+    (Md, Mx, My) = M
+    (Dx, Dy) = D
+
+    Dd = 2 * min(
+        Dx / 2 - abs(Md) - abs(Mx),
+        Dy / 2 - abs(Md) - abs(My),
+    )
+    if Dd <= 0:
+        return None
+    return Dd
