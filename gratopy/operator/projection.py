@@ -63,8 +63,9 @@ class Radon(_OpenCLOperator):
 
     This class provides the main entry point to gratopy's experimental
     operator-based projection interface. A :class:`Radon` object represents
-    either the forward projection operator or, when created through
-    :attr:`T`, its adjoint.
+    the forward projection operator. Accessing :attr:`T` creates an adjoint
+    expression wrapper that references the same :class:`Radon` instance and
+    shares its runtime caches.
 
     **Parameters**
 
@@ -96,10 +97,6 @@ class Radon(_OpenCLOperator):
 
         Plain integer inputs are converted to
         :class:`~gratopy.utilities.Detectors` with default extent handling.
-    ``adjoint``:
-        If ``False`` (the default), construct the forward Radon transform.
-        If ``True``, construct the adjoint operator directly. In practice, the
-        adjoint is typically accessed via :attr:`T`.
     ``kernel_spec``:
         Optional :class:`gratopy.operator.opencl.OpenCLKernelSpec` describing
         which OpenCL kernel bundle to use. When omitted, the operator uses the
@@ -153,7 +150,6 @@ class Radon(_OpenCLOperator):
         image_domain: int | tuple[int, int] | ImageDomain,
         angles: Angles | int,
         detectors: Detectors | int | None = None,
-        adjoint: bool = False,
         kernel_spec: OpenCLKernelSpec | None = None,
     ):
         if not isinstance(image_domain, ImageDomain):
@@ -179,7 +175,6 @@ class Radon(_OpenCLOperator):
             name="Radon",
             state=state,
             kernel_spec=kernel_spec,
-            adjoint=adjoint,
         )
 
         self.substitute_placeholder()
@@ -190,12 +185,8 @@ class Radon(_OpenCLOperator):
         image_shape = self.image_domain.size
         sinogram_shape = (self.detectors.number, len(self.angles))
 
-        if self.adjoint:
-            self.input_shape = sinogram_shape
-            self.output_shape = image_shape
-        else:
-            self.input_shape = image_shape
-            self.output_shape = sinogram_shape
+        self.input_shape = image_shape
+        self.output_shape = sinogram_shape
 
     def _default_kernel_spec(self) -> OpenCLKernelSpec:
         kernel_path = Path(__file__).resolve().parent.parent / "radon.cl"
@@ -220,9 +211,6 @@ class Radon(_OpenCLOperator):
     @property
     def detectors(self) -> Detectors:
         return self.state["detectors"]
-
-    def _repr_name_(self) -> str:
-        return "Radon.T" if self.adjoint else "Radon"
 
     def _use_full_circle(self) -> bool:
         """Decide whether extent placeholders use full-circle geometry.
@@ -431,6 +419,23 @@ class Radon(_OpenCLOperator):
             return_event=return_event,
         )
 
+    def apply_adjoint_to(
+        self,
+        argument: Any,
+        output: Any | None = None,
+        queue: cl.CommandQueue | None = None,
+        return_event: bool = False,
+        **kwargs: Any,
+    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
+        queue = self._infer_queue(argument=argument, output=output, queue=queue)
+        self.projection_settings = SimpleNamespace(queue=queue)
+        return super().apply_adjoint_to(
+            argument,
+            output=output,
+            queue=queue,
+            return_event=return_event,
+        )
+
 
 class Fanbeam(Operator):
     def __init__(
@@ -439,7 +444,6 @@ class Fanbeam(Operator):
         image_domain: int | tuple[int, int] | ImageDomain,
         angles: Angles | int,
         detectors: Detectors | int | None = None,
-        adjoint: bool = False,
     ):
         super().__init__(name="Fanbeam")
 

@@ -4,7 +4,15 @@ import pyopencl as cl
 import pyopencl.array as clarray
 
 from gratopy import ProjectionSettings, RADON, normest
-from gratopy.operator.base import IDENTITY, ZERO, Operator, OperatorArithmeticOperation
+from gratopy.operator.base import (
+    IDENTITY,
+    ZERO,
+    AdjointOperator,
+    CompositionOperator,
+    Operator,
+    ScaledOperator,
+    SumOperator,
+)
 from gratopy.operator import Radon
 from gratopy.utilities import Angles, Detectors, ExtentPlaceholder, ImageDomain
 
@@ -12,22 +20,24 @@ from gratopy.utilities import Angles, Detectors, ExtentPlaceholder, ImageDomain
 class MatrixOperator(Operator):
     def __init__(self, matrix: np.ndarray, **kwargs):
         self.matrix = matrix
-        adjoint = kwargs.get("adjoint", False)
-        input_shape = (matrix.shape[0] if adjoint else matrix.shape[1],)
-        output_shape = (matrix.shape[1] if adjoint else matrix.shape[0],)
         super().__init__(
-            input_shape=input_shape,
-            output_shape=output_shape,
+            input_shape=(matrix.shape[1],),
+            output_shape=(matrix.shape[0],),
             **kwargs,
         )
 
-    def apply_to(self, argument, output=None, **kwargs):
-        matrix = self.matrix.conj().T if self.adjoint else self.matrix
-        result = self.scalar * matrix @ argument
+    @staticmethod
+    def _write_result(result, output):
         if output is not None:
             output[...] = result
             return output
         return result
+
+    def apply_to(self, argument, output=None, **kwargs):
+        return self._write_result(self.matrix @ argument, output)
+
+    def apply_adjoint_to(self, argument, output=None, **kwargs):
+        return self._write_result(self.matrix.conj().T @ argument, output)
 
 
 class CountingAdjointMatrixOperator(MatrixOperator):
@@ -37,6 +47,11 @@ class CountingAdjointMatrixOperator(MatrixOperator):
     def T(self):
         type(self).adjoint_lookups += 1
         return super().T
+
+
+class NoDeepcopyOperator(Operator):
+    def __deepcopy__(self, memo):
+        raise AssertionError("operator algebra must not deepcopy operands")
 
 
 def test_identity_repr():
@@ -94,42 +109,66 @@ def test_operator_representation():
     assert repr(B) == "B"
     assert repr(A * B) == "A*B"
     assert repr(A + B) == "A + B"
-    assert repr(5 * (A + IDENTITY) - B) == "5*A + 5*[Id] + (-1)*B"
-    assert repr(5 * (A + IDENTITY) - B) == "5*A + 5*[Id] + (-1)*B"
-    assert repr(5 * (A + IDENTITY) * C - B) == "(5*A + 5*[Id])*C + (-1)*B"
+    assert repr(5 * (A + IDENTITY) - B) == "5*(A + [Id]) + (-1)*B"
+    assert repr(5 * (A + IDENTITY) * C - B) == "5*(A + [Id])*C + (-1)*B"
     assert repr(A * B * A * B * A * B) == "A*B*A*B*A*B"
     assert repr(5 * A * B * A * B * A * B) == "5*A*B*A*B*A*B"
     assert repr(5 * (A * B * B * A)) == "5*A*B*B*A"
 
 
-def test_operator_composition():
-    from gratopy.operator.base import OperatorArithmeticOperation
-
+def test_operator_expression_nodes_reference_original_operands():
     A = Operator(name="A")
     B = Operator(name="B")
 
-    composed_op = 5 * (A + IDENTITY) - B
-    assert composed_op.is_composite()
-    assert composed_op._arithmetic_operation == OperatorArithmeticOperation.ADDITION
-    assert len(composed_op._operands) == 3
+    operator_sum = A + B + A
+    assert isinstance(operator_sum, SumOperator)
+    assert operator_sum.operands == (A, B, A)
+    assert operator_sum.operands[0] is A
+    assert operator_sum.operands[1] is B
+
+    scaled = 5 * operator_sum
+    assert isinstance(scaled, ScaledOperator)
+    assert scaled.scalar == 5
+    assert scaled.operand is operator_sum
+
+    composition = scaled * B
+    assert isinstance(composition, CompositionOperator)
+    assert composition.operands == (scaled, B)
+    assert composition.operands[0] is scaled
+    assert composition.operands[1] is B
 
 
-def test_operator_arithmetic_references():
+def test_nested_scale_is_combined_without_mutating_operand():
     A = Operator(name="A")
-    B = Operator(name="B")
 
-    assert 5 * (A + B + A) == 5 * A + 5 * B + 5 * A
-    assert 5 * (A * B * B * A) == 5 * A * B * B * A
+    scaled = 2 * (3 * A)
+
+    assert isinstance(scaled, ScaledOperator)
+    assert scaled.scalar == 6
+    assert scaled.operand is A
+    assert repr(A) == "A"
 
 
-def test_operator_adjoint_swaps_shapes_and_is_involutive():
+def test_operator_algebra_never_deepcopies_operands():
+    A = NoDeepcopyOperator(name="A", input_shape=(2,), output_shape=(2,))
+    B = NoDeepcopyOperator(name="B", input_shape=(2,), output_shape=(2,))
+
+    expression = 3 * (A.T * A + B)
+
+    assert isinstance(expression, ScaledOperator)
+    assert isinstance(expression.operand, SumOperator)
+
+
+def test_operator_adjoint_wraps_operand_swaps_shapes_and_is_involutive():
     A = Operator(name="A", input_shape=(10,), output_shape=(20,))
+    adjoint = A.T
 
-    assert A.adjoint is False
-    assert A.T.adjoint is True
-    assert A.T.input_shape == (20,)
-    assert A.T.output_shape == (10,)
-    assert A.T.T == A
+    assert isinstance(adjoint, AdjointOperator)
+    assert adjoint.operand is A
+    assert A.T is adjoint
+    assert adjoint.input_shape == (20,)
+    assert adjoint.output_shape == (10,)
+    assert adjoint.T is A
 
 
 def test_identity_and_zero_are_self_adjoint():
@@ -137,54 +176,92 @@ def test_identity_and_zero_are_self_adjoint():
     assert ZERO.T is ZERO
 
 
-def test_sum_adjoint_is_sum_of_adjoints():
-    A = Operator(name="A", input_shape=(10,), output_shape=(20,))
-    B = Operator(name="B", input_shape=(10,), output_shape=(20,))
+def test_sum_adjoint_matches_sum_of_adjoints():
+    A = MatrixOperator(np.array([[1.0, 2.0], [3.0, 4.0]]), name="A")
+    B = MatrixOperator(np.array([[5.0, 6.0], [7.0, 8.0]]), name="B")
+    argument = np.array([2.0, -1.0])
 
-    assert (A + B).T == A.T + B.T
-    assert (3 * (A + B)).T == 3 * A.T + 3 * B.T
-
-
-def test_product_adjoint_reverses_order():
-    A = Operator(name="A", input_shape=(20,), output_shape=(30,))
-    B = Operator(name="B", input_shape=(10,), output_shape=(20,))
-
-    assert (A * B).T == B.T * A.T
-    assert (5 * A * B).T == 5 * B.T * A.T
+    np.testing.assert_allclose((A + B).T * argument, (A.T + B.T) * argument)
+    np.testing.assert_allclose(
+        (3 * (A + B)).T * argument,
+        (3 * A.T + 3 * B.T) * argument,
+    )
 
 
-def test_nested_composite_adjoint():
-    A = Operator(name="A", input_shape=(20,), output_shape=(30,))
-    B = Operator(name="B", input_shape=(20,), output_shape=(30,))
-    C = Operator(name="C", input_shape=(10,), output_shape=(20,))
+def test_product_adjoint_matches_reversed_adjoint_product():
+    A = MatrixOperator(np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]), name="A")
+    B = MatrixOperator(np.array([[2.0, -1.0], [4.0, 3.0]]), name="B")
+    argument = np.array([1.0, -2.0, 0.5])
 
-    assert ((A + B) * C).T == C.T * (A.T + B.T)
+    np.testing.assert_allclose((A * B).T * argument, (B.T * A.T) * argument)
+    np.testing.assert_allclose(
+        (5 * A * B).T * argument,
+        (5 * B.T * A.T) * argument,
+    )
 
 
-def test_radon_adjoint_uses_base_operator_state():
+def test_nested_composite_adjoint_matches_rewritten_expression():
+    A = MatrixOperator(np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]), name="A")
+    B = MatrixOperator(np.array([[2.0, -1.0], [4.0, 3.0], [1.0, 2.0]]), name="B")
+    C = MatrixOperator(np.array([[1.0, 3.0], [2.0, -1.0]]), name="C")
+    argument = np.array([1.0, -2.0, 0.5])
+
+    np.testing.assert_allclose(
+        ((A + B) * C).T * argument,
+        (C.T * (A.T + B.T)) * argument,
+    )
+
+
+def test_radon_adjoint_wraps_and_reuses_radon_operator():
     R = Radon(image_domain=16, angles=10)
+    adjoint = R.T
 
-    assert "adjoint" not in R.state
-    assert R.adjoint is False
-    assert R.T.adjoint is True
-    assert R.T.input_shape == R.output_shape
-    assert R.T.output_shape == R.input_shape
-    assert R.T.T.adjoint is False
-    assert R.T.T.input_shape == R.input_shape
-    assert R.T.T.output_shape == R.output_shape
+    assert isinstance(adjoint, AdjointOperator)
+    assert adjoint.operand is R
+    assert R.T is adjoint
+    assert adjoint.input_shape == R.output_shape
+    assert adjoint.output_shape == R.input_shape
+    assert adjoint.T is R
 
 
-def test_radon_composite_adjoint():
+def test_radon_composite_adjoint_wraps_stable_ast():
     R = Radon(image_domain=16, angles=10)
     gram = R.T * R
     gram_adjoint = gram.T
 
-    assert (
-        gram_adjoint._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION
-    )
-    assert [operand.adjoint for operand in gram_adjoint._operands] == [True, False]
+    assert isinstance(gram, CompositionOperator)
+    assert isinstance(gram.operands[0], AdjointOperator)
+    assert gram.operands[0].operand is R
+    assert gram.operands[1] is R
+    assert isinstance(gram_adjoint, AdjointOperator)
+    assert gram_adjoint.operand is gram
     assert gram_adjoint.input_shape == gram.input_shape
     assert gram_adjoint.output_shape == gram.output_shape
+
+
+def test_radon_forward_adjoint_and_rebuilt_gram_share_device_cache(monkeypatch):
+    ctx = cl.create_some_context(interactive=False)
+    queue = cl.CommandQueue(ctx)
+    R = Radon(image_domain=8, angles=5)
+    image = clarray.to_device(queue, np.ones(R.input_shape, dtype=np.float32))
+    original_ensure_device_struct = Radon._ensure_device_struct
+    cache_misses = 0
+
+    def count_cache_misses(self, queue, dtype):
+        nonlocal cache_misses
+        key = (queue.context, np.dtype(dtype))
+        if key not in self._device_struct:
+            cache_misses += 1
+        return original_ensure_device_struct(self, queue, dtype)
+
+    monkeypatch.setattr(Radon, "_ensure_device_struct", count_cache_misses)
+
+    for _ in range(3):
+        (R.T * R).apply_to(image, queue=queue)
+    queue.finish()
+
+    assert cache_misses == 1
+    assert len(R._device_struct) == 1
 
 
 def test_identity_norm_estimate():
@@ -498,6 +575,20 @@ def test_operator_sum_accumulates_into_output():
 
     assert result.data == output.data
     np.testing.assert_allclose(output.get(), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_expression_nodes_return_terminal_events():
+    ctx = cl.create_some_context(interactive=False)
+    queue = cl.CommandQueue(ctx)
+    R = Radon(image_domain=8, angles=5)
+    image = clarray.to_device(queue, np.ones(R.input_shape, dtype=np.float32))
+    expression = 2 * (R.T * R + R.T * R)
+
+    result, events = expression.apply_to(image, return_event=True)
+
+    assert isinstance(result, clarray.Array)
+    assert events == result.events
+    assert events
 
 
 def test_radon_placeholder_resolved_for_detector_extent():

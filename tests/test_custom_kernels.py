@@ -17,14 +17,12 @@ class AffineOperator(_OpenCLOperator):
     def __init__(
         self,
         shape: tuple[int, ...],
-        adjoint: bool = False,
         kernel_spec: OpenCLKernelSpec | None = None,
     ):
         super().__init__(
             name="AffineOperator",
             input_shape=shape,
             output_shape=shape,
-            adjoint=adjoint,
             kernel_spec=kernel_spec,
         )
 

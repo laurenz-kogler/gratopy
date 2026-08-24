@@ -1,3 +1,11 @@
 from .projection import Radon, Fanbeam
-from .base import IDENTITY, ZERO
+from .base import (
+    IDENTITY,
+    ZERO,
+    AdjointOperator,
+    CompositionOperator,
+    Operator,
+    ScaledOperator,
+    SumOperator,
+)
 from .opencl import OpenCLKernelSpec

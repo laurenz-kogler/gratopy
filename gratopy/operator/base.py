@@ -1,28 +1,20 @@
-"""Generic implementation of operators including basic arithmetic."""
+"""Generic operators and expression nodes for operator algebra."""
 
 from __future__ import annotations
+
+from math import prod
+from numbers import Integral, Number
+from typing import Any, Literal, Sequence
+from weakref import ReferenceType, ref
 
 import numpy as np
 import numpy.typing as npt
 
-from enum import Enum
-from math import prod
-from numbers import Integral, Number
-from typing import Any, Literal
-from copy import deepcopy
-
 from gratopy.utilities import Numeric
 
 
-class OperatorArithmeticOperation(Enum):
-    """Enum for operations that can be performed on operators."""
-
-    ADDITION = "sum"
-    MULTIPLICATION = "prod"
-
-
 def _compute_sum_shapes(
-    operands: list[Operator],
+    operands: Sequence[Operator],
 ) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
     input_shape = None
     output_shape = None
@@ -48,10 +40,9 @@ def _compute_sum_shapes(
 
 
 def _compute_product_shapes(
-    operands: list[Operator],
+    operands: Sequence[Operator],
 ) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
-    for i in range(len(operands) - 1):
-        left, right = operands[i], operands[i + 1]
+    for left, right in zip(operands, operands[1:]):
         if left.input_shape is not None and right.output_shape is not None:
             if left.input_shape != right.output_shape:
                 raise ValueError(
@@ -64,156 +55,73 @@ def _compute_product_shapes(
     return input_shape, output_shape
 
 
+def _scalar_repr(scalar: Numeric) -> str:
+    scalar_repr = repr(scalar)
+    if scalar < 0:
+        return f"({scalar_repr})"
+    return scalar_repr
+
+
+def _with_return_event(result: Any, return_event: bool) -> Any:
+    if not return_event:
+        return result
+    return result, list(getattr(result, "events", []))
+
+
 class Operator:
-    """Base class for all operators."""
+    """Base class for operators and operator expression nodes."""
 
     def __init__(
         self,
         name: str | None = None,
-        scalar: Numeric = 1,
         state: dict[str, Any] | None = None,
-        arithmetic_operation: OperatorArithmeticOperation | None = None,
-        operands: list[Operator] | None = None,
         input_shape: tuple[int, ...] | None = None,
         output_shape: tuple[int, ...] | None = None,
-        adjoint: bool = False,
     ):
-        if name is None:
-            name = self.__class__.__name__
-        self.name = name
-
-        if state is None:
-            state = {}
-        self.state = state
-
-        self._arithmetic_operation = arithmetic_operation
-        if operands is None:
-            operands = []
-        self._operands = operands
-
-        self._scalar: Numeric = 1
-        self.scalar = scalar
-
+        self.name = self.__class__.__name__ if name is None else name
+        self.state = {} if state is None else state
         self.input_shape = input_shape
         self.output_shape = output_shape
-        self._adjoint = adjoint
+        self._adjoint_ref: ReferenceType[AdjointOperator] | None = None
 
-    def _scalar_repr_(self) -> str:
-        scalar_repr = ""
-        if self.scalar != 1:
-            scalar_repr = repr(self.scalar)
-            if self.scalar < 0:
-                scalar_repr = f"({scalar_repr})"
-        return scalar_repr
-
-    def _composite_repr_(self) -> str:
-        """Representation of a composite operator."""
-        assert self.is_composite(), "This method is for composite operators only."
-        scalar_repr = self._scalar_repr_()
-        if self._arithmetic_operation == OperatorArithmeticOperation.ADDITION:
-            op_repr = " + ".join(repr(op) for op in self._operands)
-            if scalar_repr:
-                return f"{scalar_repr}*({op_repr})"
-            return op_repr
-        elif self._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION:
-            op_reprs = []
-            for op in self._operands:
-                if op.is_composite():
-                    op_reprs.append(f"({repr(op)})")
-                else:
-                    op_reprs.append(repr(op))
-            op_repr = "*".join(op_reprs)
-            if scalar_repr:
-                return f"{scalar_repr}*{op_repr}"
-            return op_repr
-        raise ValueError(f"Unknown arithmetic operation: {self._arithmetic_operation}")
+    def __getstate__(self) -> dict[str, Any]:
+        """Return serializable state without the weak adjoint memoization."""
+        state = self.__dict__.copy()
+        state["_adjoint_ref"] = None
+        return state
 
     def _repr_name_(self) -> str:
         """Return the operator name used in string representations."""
         return self.name
 
     def __repr__(self) -> str:
-        if not self.is_composite():
-            scalar_repr = self._scalar_repr_()
-            name = self._repr_name_()
-            if scalar_repr:
-                return f"{scalar_repr}*{name}"
-            return name
-        return self._composite_repr_()
+        return self._repr_name_()
 
     def __eq__(self, other: Any) -> bool:
-        """Check equality of two operators."""
+        """Check structural equality of two operators."""
         if not isinstance(other, Operator):
             return False
-
         return all(
             [
                 type(self) is type(other),
                 self.name == other.name,
-                self.scalar == other.scalar,
                 self.state == other.state,
-                self._arithmetic_operation == other._arithmetic_operation,
-                self._operands == other._operands,
                 self.input_shape == other.input_shape,
                 self.output_shape == other.output_shape,
-                self.adjoint == other.adjoint,
             ]
         )
 
     @property
-    def adjoint(self) -> bool:
-        """Whether this operator represents its adjoint action."""
-        return self._adjoint
-
-    @property
     def T(self) -> Operator:
-        """Return the adjoint operator.
+        """Return a memoized adjoint wrapper referencing this operator."""
+        if self._adjoint_ref is not None:
+            adjoint = self._adjoint_ref()
+            if adjoint is not None:
+                return adjoint
 
-        Composite adjoints follow the usual algebraic rules:
-        ``(A + B).T = A.T + B.T`` and ``(A * B).T = B.T * A.T``.
-        """
-        if self.is_composite():
-            if self._arithmetic_operation == OperatorArithmeticOperation.ADDITION:
-                adjoint = self._operands[0].T
-                for operand in self._operands[1:]:
-                    adjoint = adjoint + operand.T
-                return np.conjugate(self.scalar) * adjoint
-
-            if self._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION:
-                operands = [operand.T for operand in reversed(self._operands)]
-                adjoint = operands[0]
-                for operand in operands[1:]:
-                    adjoint = adjoint * operand
-                return np.conjugate(self.scalar) * adjoint
-
-            raise ValueError(
-                f"Unknown arithmetic operation: {self._arithmetic_operation}"
-            )
-
-        operator_copy = deepcopy(self)
-        operator_copy._adjoint = not self._adjoint
-        operator_copy.scalar = np.conjugate(operator_copy.scalar)
-        operator_copy.input_shape, operator_copy.output_shape = (
-            operator_copy.output_shape,
-            operator_copy.input_shape,
-        )
-        return operator_copy
-
-    @property
-    def scalar(self) -> Numeric:
-        return self._scalar
-
-    @scalar.setter
-    def scalar(self, value: Numeric):
-        """Set the scalar value of the operator."""
-        if self.is_composite():
-            if self._arithmetic_operation == OperatorArithmeticOperation.ADDITION:
-                for child_operator in self._operands:
-                    child_operator.scalar = child_operator.scalar * value
-            elif self._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION:
-                self._operands[0].scalar = self._operands[0].scalar * value
-        else:
-            self._scalar = value
+        adjoint = AdjointOperator(self)
+        self._adjoint_ref = ref(adjoint)
+        return adjoint
 
     def norm_estimate(
         self,
@@ -237,13 +145,12 @@ class Operator:
             Shape of the starting vector. Defaults to :attr:`input_shape`.
         algorithm:
             ``"poweriteration"`` applies power iteration to ``self.T * self``.
-            ``"naive"`` combines power-iteration estimates for composite leaves
+            ``"naive"`` combines power-iteration estimates for expression leaves
             using the triangle inequality for sums and submultiplicativity for
-            products. Since the leaf norms are themselves estimates, the result
+            compositions. Since leaf norms are themselves estimates, the result
             is a heuristic and not a guaranteed upper bound.
         queue:
-            Optional backend-specific execution queue forwarded to operator
-            applications.
+            Optional backend-specific execution queue forwarded to applications.
         rng:
             Random-number generator used to construct the starting vector.
         """
@@ -263,26 +170,16 @@ class Operator:
         if exact_norm is not None:
             return exact_norm
 
-        if algorithm == "naive" and self.is_composite():
-            child_norms = [
-                operand.norm_estimate(
-                    number_iterations=number_iterations,
-                    dtype=dtype,
-                    algorithm=algorithm,
-                    queue=queue,
-                    rng=rng,
-                    **kwargs,
-                )
-                for operand in self._operands
-            ]
-            scalar_magnitude = abs(float(self.scalar))
-            if self._arithmetic_operation == OperatorArithmeticOperation.ADDITION:
-                return scalar_magnitude * sum(child_norms)
-            if self._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION:
-                return scalar_magnitude * prod(child_norms)
-            raise ValueError(
-                f"Unknown arithmetic operation: {self._arithmetic_operation}"
+        if algorithm == "naive":
+            naive_norm = self._naive_norm_estimate(
+                number_iterations=number_iterations,
+                dtype=dtype,
+                queue=queue,
+                rng=rng,
+                **kwargs,
             )
+            if naive_norm is not None:
+                return naive_norm
 
         return self._power_iteration_norm_estimate(
             number_iterations=number_iterations,
@@ -295,6 +192,10 @@ class Operator:
 
     def _exact_norm(self) -> float | None:
         """Return an exact norm when one is available for this operator."""
+        return None
+
+    def _naive_norm_estimate(self, **kwargs: Any) -> float | None:
+        """Return a structural norm estimate, or defer to power iteration."""
         return None
 
     def _power_iteration_norm_estimate(
@@ -341,9 +242,7 @@ class Operator:
                 return 0.0
 
             # Since x is normalized, ||(A.T * A)x|| converges to the dominant
-            # eigenvalue of A.T * A. Its square root is the operator norm. This
-            # remains valid when T represents an adjoint for weighted inner
-            # products, as is the case for gratopy's projection operators.
+            # eigenvalue of A.T * A. Its square root is the operator norm.
             estimate = float(np.sqrt(z_norm))
             x = z / z_norm
 
@@ -351,8 +250,6 @@ class Operator:
 
     def _vector_norm(self, vector: Any) -> float:
         """Compute a vector norm using this operator's array backend."""
-        if self.is_composite():
-            return self._operands[0]._vector_norm(vector)
         return float(np.linalg.norm(vector))
 
     def apply_to(
@@ -361,188 +258,383 @@ class Operator:
         output: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Application of this operator to some given argument.
-
-        For composite products, ``output`` is passed only to the final child
-        operator. Intermediate results are computed normally while the final
-        result can reuse the caller-provided array.
-        """
-        if self.is_composite():
-            if self._arithmetic_operation == OperatorArithmeticOperation.ADDITION:
-                if output is None:
-                    result = self._operands[0].apply_to(argument, **kwargs)
-                    for child_op in self._operands[1:]:
-                        result += child_op.apply_to(argument, **kwargs)
-                    return result
-
-                result = self._operands[0].apply_to(argument, output=output, **kwargs)
-                for child_op in self._operands[1:]:
-                    result += child_op.apply_to(argument, **kwargs)
-                return result
-            elif self._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION:
-                result = argument
-                application_order = list(reversed(self._operands))
-                for index, child_op in enumerate(application_order):
-                    child_output = output if index == len(application_order) - 1 else None
-                    result = child_op.apply_to(result, output=child_output, **kwargs)
-                return result
-
+        """Apply the operator in its forward direction."""
         raise NotImplementedError(
             "apply_to needs to be implemented in specialized subclasses"
         )
 
+    def apply_adjoint_to(
+        self,
+        argument: Any,
+        output: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Apply the adjoint operator."""
+        raise NotImplementedError(
+            "apply_adjoint_to needs to be implemented in specialized subclasses"
+        )
+
     def is_composite(self) -> bool:
-        """Check if the operator is composite."""
-        return self._arithmetic_operation is not None
+        """Return whether this is a sum or composition expression node."""
+        return isinstance(self, (SumOperator, CompositionOperator))
 
     def __add__(self, other: Operator) -> Operator:
         """Add another operator to this one."""
         if not isinstance(other, Operator):
             raise TypeError(f"Cannot add {type(other)} to {type(self)}")
-
         if isinstance(other, _ZeroOperator):
             return self
-
-        operands = []
-        for operator in [deepcopy(self), deepcopy(other)]:
-            if (
-                operator.is_composite()
-                and operator._arithmetic_operation == OperatorArithmeticOperation.ADDITION
-            ):
-                for child_operator in operator._operands:
-                    child_operator.scalar *= operator.scalar
-                    operands.append(child_operator)
-            else:
-                operands.append(operator)
-
-        input_shape, output_shape = _compute_sum_shapes(operands)
-
-        return Operator(
-            name=None,
-            scalar=1,
-            arithmetic_operation=OperatorArithmeticOperation.ADDITION,
-            operands=operands,
-            input_shape=input_shape,
-            output_shape=output_shape,
-        )
+        if isinstance(self, _ZeroOperator):
+            return other
+        return SumOperator.create(self, other)
 
     def __neg__(self) -> Operator:
         """Negate this operator."""
-        return self.__rmul__(-1)
+        return ScaledOperator.create(-1, self)
 
     def __sub__(self, other: Operator) -> Operator:
         """Subtract another operator from this one."""
         return self + (-other)
 
     def __rmul__(self, other: Numeric) -> Operator:  # type: ignore[misc]
-        """Right-multiply this operator by a scalar."""
-        if other == 0:
-            return ZERO
-        if other == 1:
-            return self
-
-        operator_copy = deepcopy(self)
-        operator_copy.scalar = operator_copy.scalar * other
-        return operator_copy
+        """Multiply this operator by a scalar."""
+        if not isinstance(other, Number):
+            return NotImplemented
+        return ScaledOperator.create(other, self)  # type: ignore[arg-type]
 
     def __mul__(self, other: Operator | Any) -> Operator | Any:
-        """Multiply this operator by another operator, or apply it to appropriate input."""
-        if not isinstance(other, Operator):
-            if isinstance(other, Number):
-                return self.__rmul__(other)  # type: ignore[arg-type, operator]
+        """Compose, scale, or apply this operator."""
+        if isinstance(other, Operator):
+            if isinstance(self, _ZeroOperator) or isinstance(other, _ZeroOperator):
+                return ZERO
+            if isinstance(self, _IdentityOperator):
+                return other
+            if isinstance(other, _IdentityOperator):
+                return self
+            return CompositionOperator.create(self, other)
 
-            # attempt to apply the operator to the input
-            return self.apply_to(other)
+        if isinstance(other, Number):
+            return ScaledOperator.create(other, self)  # type: ignore[arg-type]
 
-        if isinstance(other, _ZeroOperator):
-            return other
+        return self.apply_to(other)
 
-        if isinstance(other, _IdentityOperator):
-            return self
 
-        operands = []
-        scalar: Numeric = 1
-        for operator in [deepcopy(self), deepcopy(other)]:
-            if (
-                operator.is_composite()
-                and operator._arithmetic_operation
-                == OperatorArithmeticOperation.MULTIPLICATION
-            ):
-                operands.extend(operator._operands)
-            else:
-                scalar *= operator.scalar
-                operator.scalar = 1
-                operands.append(operator)
+class AdjointOperator(Operator):
+    """Adjoint view of an underlying operator."""
 
-        input_shape, output_shape = _compute_product_shapes(operands)
-
-        return Operator(
-            name=None,
-            scalar=scalar,
-            arithmetic_operation=OperatorArithmeticOperation.MULTIPLICATION,
-            operands=operands,
-            input_shape=input_shape,
-            output_shape=output_shape,
+    def __init__(self, operand: Operator):
+        super().__init__(
+            name=f"{operand.name}.T",
+            input_shape=operand.output_shape,
+            output_shape=operand.input_shape,
         )
+        self._operand = operand
 
-
-class _IdentityOperator(Operator):
-    """Base class for identity operator."""
+    @property
+    def operand(self) -> Operator:
+        return self._operand
 
     @property
     def T(self) -> Operator:
-        """The identity operator is self-adjoint."""
-        return self
+        """The adjoint of an adjoint is the underlying operator."""
+        return self.operand
 
-    def __mul__(self, other: Operator | Any) -> Operator | Any:
-        """Multiplying the identity operator with another operator returns
-        the other operator."""
-        if isinstance(other, Operator):
-            return other
-        return super().__mul__(other)
+    def __repr__(self) -> str:
+        if isinstance(self.operand, (SumOperator, CompositionOperator)):
+            return f"({self.operand!r}).T"
+        return f"{self.operand!r}.T"
 
-    def _exact_norm(self) -> float:
-        """Return the exact norm of the identity operator."""
-        return abs(float(self.scalar))
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, AdjointOperator) and self.operand == other.operand
+
+    def _exact_norm(self) -> float | None:
+        return self.operand._exact_norm()
+
+    def _naive_norm_estimate(self, **kwargs: Any) -> float | None:
+        return self.operand._naive_norm_estimate(**kwargs)
+
+    def _vector_norm(self, vector: Any) -> float:
+        return self.operand._vector_norm(vector)
 
     def apply_to(self, argument: Any, output: Any | None = None, **kwargs: Any) -> Any:
-        """The identity operator does not change the input."""
-        result = self.scalar * argument
-        if output is not None:
-            output[...] = result
-            return output
-        return result
+        return self.operand.apply_adjoint_to(argument, output=output, **kwargs)
+
+    def apply_adjoint_to(
+        self, argument: Any, output: Any | None = None, **kwargs: Any
+    ) -> Any:
+        return self.operand.apply_to(argument, output=output, **kwargs)
 
 
-class _ZeroOperator(Operator):
-    """Base class for zero operator."""
+class ScaledOperator(Operator):
+    """An operator multiplied by a scalar."""
 
-    @property
-    def T(self) -> Operator:
-        """The zero operator is self-adjoint."""
-        # This singleton zero operator is shape-agnostic. If we later introduce
-        # shape-aware zero operators, their adjoints should swap input and
-        # output shapes just like regular operators.
-        return self
-
-    def __add__(self, other: Operator) -> Operator:
-        """Adding zero operator to any operator returns the other operator."""
-        return other
+    def __init__(self, scalar: Numeric, operand: Operator):
+        super().__init__(
+            name=operand.name,
+            input_shape=operand.input_shape,
+            output_shape=operand.output_shape,
+        )
+        self._scalar = scalar
+        self._operand = operand
 
     @property
     def scalar(self) -> Numeric:
         return self._scalar
 
-    @scalar.setter
-    def scalar(self, value: Numeric):
-        pass
+    @property
+    def operand(self) -> Operator:
+        return self._operand
+
+    @classmethod
+    def create(cls, scalar: Numeric, operand: Operator) -> Operator:
+        if scalar == 0 or isinstance(operand, _ZeroOperator):
+            return ZERO
+        if scalar == 1:
+            return operand
+        if isinstance(operand, ScaledOperator):
+            return cls.create(scalar * operand.scalar, operand.operand)
+        return cls(scalar, operand)
+
+    def __repr__(self) -> str:
+        operand_repr = repr(self.operand)
+        if isinstance(self.operand, SumOperator):
+            operand_repr = f"({operand_repr})"
+        return f"{_scalar_repr(self.scalar)}*{operand_repr}"
+
+    def __eq__(self, other: Any) -> bool:
+        return (
+            isinstance(other, ScaledOperator)
+            and self.scalar == other.scalar
+            and self.operand == other.operand
+        )
+
+    def _exact_norm(self) -> float | None:
+        operand_norm = self.operand._exact_norm()
+        if operand_norm is None:
+            return None
+        return abs(float(self.scalar)) * operand_norm
+
+    def _naive_norm_estimate(self, **kwargs: Any) -> float:
+        return abs(float(self.scalar)) * self.operand.norm_estimate(
+            algorithm="naive", **kwargs
+        )
+
+    def _vector_norm(self, vector: Any) -> float:
+        return self.operand._vector_norm(vector)
+
+    def _apply_scaled(
+        self,
+        argument: Any,
+        output: Any | None,
+        adjoint: bool,
+        **kwargs: Any,
+    ) -> Any:
+        return_event = bool(kwargs.pop("return_event", False))
+        apply = self.operand.apply_adjoint_to if adjoint else self.operand.apply_to
+        result = apply(argument, output=output, **kwargs)
+
+        scalar = np.conjugate(self.scalar) if adjoint else self.scalar
+        try:
+            scalar = result.dtype.type(scalar)
+        except AttributeError:
+            pass
+        result *= scalar
+        return _with_return_event(result, return_event)
+
+    def apply_to(self, argument: Any, output: Any | None = None, **kwargs: Any) -> Any:
+        return self._apply_scaled(argument, output, False, **kwargs)
+
+    def apply_adjoint_to(
+        self, argument: Any, output: Any | None = None, **kwargs: Any
+    ) -> Any:
+        return self._apply_scaled(argument, output, True, **kwargs)
+
+
+class SumOperator(Operator):
+    """A sum of operators with compatible input and output shapes."""
+
+    def __init__(self, operands: tuple[Operator, ...]):
+        input_shape, output_shape = _compute_sum_shapes(operands)
+        super().__init__(input_shape=input_shape, output_shape=output_shape)
+        self._operands = operands
+
+    @property
+    def operands(self) -> tuple[Operator, ...]:
+        return self._operands
+
+    @classmethod
+    def create(cls, *operators: Operator) -> Operator:
+        operands: list[Operator] = []
+        for operator in operators:
+            if isinstance(operator, _ZeroOperator):
+                continue
+            if isinstance(operator, SumOperator):
+                operands.extend(operator.operands)
+            else:
+                operands.append(operator)
+        if not operands:
+            return ZERO
+        if len(operands) == 1:
+            return operands[0]
+        return cls(tuple(operands))
+
+    def __repr__(self) -> str:
+        return " + ".join(repr(op) for op in self.operands)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SumOperator) and self.operands == other.operands
+
+    def _naive_norm_estimate(self, **kwargs: Any) -> float:
+        return sum(
+            operand.norm_estimate(algorithm="naive", **kwargs)
+            for operand in self.operands
+        )
+
+    def _vector_norm(self, vector: Any) -> float:
+        return self.operands[0]._vector_norm(vector)
+
+    def _apply_sum(
+        self,
+        argument: Any,
+        output: Any | None,
+        adjoint: bool,
+        **kwargs: Any,
+    ) -> Any:
+        return_event = bool(kwargs.pop("return_event", False))
+
+        def apply(operand: Operator, child_output: Any | None = None) -> Any:
+            if adjoint:
+                return operand.apply_adjoint_to(
+                    argument,
+                    output=child_output,
+                    **kwargs,
+                )
+            return operand.apply_to(argument, output=child_output, **kwargs)
+
+        result = apply(self.operands[0], output)
+        for operand in self.operands[1:]:
+            result += apply(operand)
+        return _with_return_event(result, return_event)
+
+    def apply_to(self, argument: Any, output: Any | None = None, **kwargs: Any) -> Any:
+        return self._apply_sum(argument, output, False, **kwargs)
+
+    def apply_adjoint_to(
+        self, argument: Any, output: Any | None = None, **kwargs: Any
+    ) -> Any:
+        return self._apply_sum(argument, output, True, **kwargs)
+
+
+class CompositionOperator(Operator):
+    """A composition ``A*B`` representing ``A(B(x))``."""
+
+    def __init__(self, operands: tuple[Operator, ...]):
+        input_shape, output_shape = _compute_product_shapes(operands)
+        super().__init__(input_shape=input_shape, output_shape=output_shape)
+        self._operands = operands
+
+    @property
+    def operands(self) -> tuple[Operator, ...]:
+        return self._operands
+
+    @classmethod
+    def create(cls, *operators: Operator) -> Operator:
+        operands: list[Operator] = []
+        for operator in operators:
+            if isinstance(operator, _ZeroOperator):
+                return ZERO
+            if isinstance(operator, _IdentityOperator):
+                continue
+            if isinstance(operator, CompositionOperator):
+                operands.extend(operator.operands)
+            else:
+                operands.append(operator)
+        if not operands:
+            return IDENTITY
+        if len(operands) == 1:
+            return operands[0]
+        return cls(tuple(operands))
+
+    def __repr__(self) -> str:
+        representations = []
+        for operand in self.operands:
+            operand_repr = repr(operand)
+            if isinstance(operand, SumOperator):
+                operand_repr = f"({operand_repr})"
+            representations.append(operand_repr)
+        return "*".join(representations)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, CompositionOperator) and self.operands == other.operands
+
+    def _naive_norm_estimate(self, **kwargs: Any) -> float:
+        return prod(
+            operand.norm_estimate(algorithm="naive", **kwargs)
+            for operand in self.operands
+        )
+
+    def _vector_norm(self, vector: Any) -> float:
+        return self.operands[0]._vector_norm(vector)
+
+    def _apply_composition(
+        self,
+        argument: Any,
+        output: Any | None,
+        adjoint: bool,
+        **kwargs: Any,
+    ) -> Any:
+        return_event = bool(kwargs.pop("return_event", False))
+        result = argument
+        application_order = self.operands if adjoint else tuple(reversed(self.operands))
+        for index, operand in enumerate(application_order):
+            child_output = output if index == len(application_order) - 1 else None
+            apply = operand.apply_adjoint_to if adjoint else operand.apply_to
+            result = apply(result, output=child_output, **kwargs)
+        return _with_return_event(result, return_event)
+
+    def apply_to(self, argument: Any, output: Any | None = None, **kwargs: Any) -> Any:
+        return self._apply_composition(argument, output, False, **kwargs)
+
+    def apply_adjoint_to(
+        self, argument: Any, output: Any | None = None, **kwargs: Any
+    ) -> Any:
+        return self._apply_composition(argument, output, True, **kwargs)
+
+
+class _IdentityOperator(Operator):
+    """Shape-agnostic identity operator."""
+
+    @property
+    def T(self) -> Operator:
+        return self
 
     def _exact_norm(self) -> float:
-        """Return the exact norm of the zero operator."""
+        return 1.0
+
+    def apply_to(self, argument: Any, output: Any | None = None, **kwargs: Any) -> Any:
+        result = 1 * argument
+        if output is not None:
+            output[...] = result
+            return output
+        return result
+
+    def apply_adjoint_to(
+        self, argument: Any, output: Any | None = None, **kwargs: Any
+    ) -> Any:
+        return self.apply_to(argument, output=output, **kwargs)
+
+
+class _ZeroOperator(Operator):
+    """Shape-agnostic zero operator."""
+
+    @property
+    def T(self) -> Operator:
+        return self
+
+    def _exact_norm(self) -> float:
         return 0.0
 
     def apply_to(self, argument: Any, output: Any | None = None, **kwargs: Any) -> Any:
-        """Applying the zero operator returns a zero-multiplied version of the input."""
         if output is not None:
             output[...] = 0
             return output
@@ -558,6 +650,11 @@ class _ZeroOperator(Operator):
             pass
 
         raise TypeError(f"Cannot apply zero operator to {type(argument)}")
+
+    def apply_adjoint_to(
+        self, argument: Any, output: Any | None = None, **kwargs: Any
+    ) -> Any:
+        return self.apply_to(argument, output=output, **kwargs)
 
 
 IDENTITY = _IdentityOperator(name="[Id]")

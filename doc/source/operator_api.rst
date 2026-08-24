@@ -168,8 +168,11 @@ raises :class:`ValueError`.
 Operator algebra
 ----------------
 
-Operators inherit from :class:`gratopy.operator.base.Operator`, which supports
-basic arithmetic and composition. For example, one can form a Gram operator
+Operators inherit from :class:`gratopy.operator.base.Operator`, which builds
+non-mutating expression nodes for arithmetic, scaling, adjoints, and
+composition. Expression nodes retain references to their original operands;
+they do not copy concrete operators or their runtime caches. For example, one
+can form a Gram operator
 
 .. code-block:: python
 
@@ -196,8 +199,9 @@ backward-incompatible ways without a full deprecation cycle while the design is
 settling.
 
 :class:`gratopy.operator.base.Operator`
-    Provides generic operator arithmetic such as addition, scalar
-    multiplication, composition, and application.
+    Provides the common operator interface and constructs dedicated adjoint,
+    scale, sum, and composition expression nodes. Concrete operands are shared
+    across the expression tree rather than copied.
 
 :class:`gratopy.operator.opencl._OpenCLOperator`
     Internal helper base for OpenCL-backed operators. It implements shared
@@ -244,12 +248,14 @@ The default execution pipeline performs, in order:
 
 1. queue inference,
 2. coercion of array-like inputs to :class:`pyopencl.array.Array`,
-3. input validation,
+3. direction-aware input validation,
 4. output allocation (if needed),
 5. output validation,
-6. kernel lookup,
-7. kernel invocation,
-8. multiplication by the operator scalar.
+6. forward or adjoint kernel lookup,
+7. kernel invocation.
+
+Scalar multiplication is represented by a dedicated expression node instead
+of mutating or copying the concrete OpenCL operator.
 
 Subclasses can adapt this behavior mostly via hooks instead of overriding the
 entire method.
@@ -271,8 +277,11 @@ Important hooks are:
 - :py:meth:`gratopy.operator.opencl._OpenCLOperator._global_shape`
   for customizing the OpenCL launch shape.
 
-In simple cases, a custom operator only needs to provide a kernel spec,
-`adjoint` / `T` behavior, and static input/output shapes.
+In simple cases, a custom operator only needs to provide a kernel spec and
+static input/output shapes. The shared OpenCL implementation dispatches the
+forward and adjoint kernels through :meth:`apply_to` and
+:meth:`apply_adjoint_to`; :attr:`T` is an adjoint expression wrapper around the
+same concrete operator and therefore shares its runtime caches.
 
 Limitations and status
 ----------------------

@@ -186,7 +186,7 @@ class _OpenCLOperator(Operator):
 
     def __getstate__(self) -> dict[str, Any]:
         """Return pickle/deepcopy state without live OpenCL queue handles."""
-        state = self.__dict__.copy()
+        state = super().__getstate__()
         state["_last_queue"] = None
         return state
 
@@ -323,35 +323,53 @@ class _OpenCLOperator(Operator):
         )
         return kernels[kernel_name]
 
-    def _expected_output_shape(self, argument_shape: tuple[int, ...]) -> tuple[int, ...]:
-        """Return the expected output shape for a given input shape."""
-        if self.input_shape is None or self.output_shape is None:
+    def _expected_output_shape(
+        self,
+        argument_shape: tuple[int, ...],
+        *,
+        adjoint: bool = False,
+    ) -> tuple[int, ...]:
+        """Return the expected output shape for an execution direction."""
+        input_shape = self.output_shape if adjoint else self.input_shape
+        output_shape = self.input_shape if adjoint else self.output_shape
+        if input_shape is None or output_shape is None:
             raise NotImplementedError(
                 "Concrete OpenCL operators must define _expected_output_shape() or "
                 "set input_shape/output_shape appropriately."
             )
 
-        extra_dims = argument_shape[len(self.input_shape) :]
-        return self.output_shape + extra_dims
+        extra_dims = argument_shape[len(input_shape) :]
+        return output_shape + extra_dims
 
-    def _validate_argument(self, argument: clarray.Array) -> None:
+    def _validate_argument(
+        self,
+        argument: clarray.Array,
+        *,
+        adjoint: bool = False,
+    ) -> None:
         """Validate an input argument before kernel execution."""
-        if self.input_shape is None:
+        input_shape = self.output_shape if adjoint else self.input_shape
+        if input_shape is None:
             return
 
-        if argument.shape[0 : len(self.input_shape)] != self.input_shape:
+        if argument.shape[0 : len(input_shape)] != input_shape:
             raise ValueError(
-                f"Input shape mismatch: expected {self.input_shape}, got {argument.shape}"
+                f"Input shape mismatch: expected {input_shape}, got {argument.shape}"
             )
 
     def _validate_output(
         self,
         output: clarray.Array,
         argument: clarray.Array,
+        *,
+        adjoint: bool = False,
     ) -> clarray.Array:
         """Validate and normalize an output array before kernel execution."""
         output = output.with_queue(argument.queue)
-        expected_shape = self._expected_output_shape(argument.shape)
+        expected_shape = self._expected_output_shape(
+            argument.shape,
+            adjoint=adjoint,
+        )
 
         if output.dtype != argument.dtype:
             raise ValueError(
@@ -384,14 +402,16 @@ class _OpenCLOperator(Operator):
         output: clarray.Array,
         argument: clarray.Array,
         queue: cl.CommandQueue,
+        *,
+        adjoint: bool = False,
     ) -> cl.Kernel:
-        """Return the kernel used for standard OpenCL operator execution."""
+        """Return the kernel used for an OpenCL execution direction."""
         return self._get_projection_kernel(
             queue.context,
             dtype=argument.dtype,
             output_order=self._default_order(output),
             input_order=self._default_order(argument),
-            adjoint=getattr(self, "adjoint", False),
+            adjoint=adjoint,
         )
 
     def _global_shape(
@@ -402,34 +422,31 @@ class _OpenCLOperator(Operator):
         """Return the global shape used for kernel execution."""
         return output.shape
 
-    def apply_to(
+    def _apply_opencl(
         self,
         argument: Any,
-        output: Any | None = None,
-        queue: cl.CommandQueue | None = None,
-        return_event: bool = False,
-        **kwargs: Any,
+        output: Any | None,
+        queue: cl.CommandQueue | None,
+        return_event: bool,
+        *,
+        adjoint: bool,
     ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
-        """Standard OpenCL-backed operator execution pipeline.
-
-        Passing ``output`` lets callers provide a preallocated device array and
-        avoid allocating a new OpenCL array for the result.
-        """
+        """Execute one direction through the shared OpenCL pipeline."""
         queue = self._infer_queue(argument=argument, output=output, queue=queue)
         argument = self._coerce_argument(argument, queue)
-        self._validate_argument(argument)
+        self._validate_argument(argument, adjoint=adjoint)
 
         if output is None:
             output = self._allocate_output(
                 queue=queue,
-                shape=self._expected_output_shape(argument.shape),
+                shape=self._expected_output_shape(argument.shape, adjoint=adjoint),
                 dtype=argument.dtype,
                 order=self._default_order(argument),
                 allocator=argument.allocator,
             )
-        output = self._validate_output(output, argument)
+        output = self._validate_output(output, argument, adjoint=adjoint)
 
-        kernel = self._get_kernel(output, argument, queue)
+        kernel = self._get_kernel(output, argument, queue, adjoint=adjoint)
         event = self._invoke_kernel(
             kernel,
             queue,
@@ -440,12 +457,44 @@ class _OpenCLOperator(Operator):
             wait_for=output.events + argument.events,
         )
         output.add_event(event)
-        if self.scalar != 1:
-            output *= output.dtype.type(self.scalar)
 
         if return_event:
             return output, [event]
         return output
+
+    def apply_to(
+        self,
+        argument: Any,
+        output: Any | None = None,
+        queue: cl.CommandQueue | None = None,
+        return_event: bool = False,
+        **kwargs: Any,
+    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
+        """Apply the forward OpenCL kernel."""
+        return self._apply_opencl(
+            argument,
+            output,
+            queue,
+            return_event,
+            adjoint=False,
+        )
+
+    def apply_adjoint_to(
+        self,
+        argument: Any,
+        output: Any | None = None,
+        queue: cl.CommandQueue | None = None,
+        return_event: bool = False,
+        **kwargs: Any,
+    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
+        """Apply the adjoint OpenCL kernel."""
+        return self._apply_opencl(
+            argument,
+            output,
+            queue,
+            return_event,
+            adjoint=True,
+        )
 
     @staticmethod
     def _invoke_kernel(
