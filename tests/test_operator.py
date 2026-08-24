@@ -3,9 +3,40 @@ import pytest
 import pyopencl as cl
 import pyopencl.array as clarray
 
+from gratopy import ProjectionSettings, RADON, normest
 from gratopy.operator.base import IDENTITY, ZERO, Operator, OperatorArithmeticOperation
 from gratopy.operator import Radon
 from gratopy.utilities import Angles, Detectors, ExtentPlaceholder, ImageDomain
+
+
+class MatrixOperator(Operator):
+    def __init__(self, matrix: np.ndarray, **kwargs):
+        self.matrix = matrix
+        adjoint = kwargs.get("adjoint", False)
+        input_shape = (matrix.shape[0] if adjoint else matrix.shape[1],)
+        output_shape = (matrix.shape[1] if adjoint else matrix.shape[0],)
+        super().__init__(
+            input_shape=input_shape,
+            output_shape=output_shape,
+            **kwargs,
+        )
+
+    def apply_to(self, argument, output=None, **kwargs):
+        matrix = self.matrix.conj().T if self.adjoint else self.matrix
+        result = self.scalar * matrix @ argument
+        if output is not None:
+            output[...] = result
+            return output
+        return result
+
+
+class CountingAdjointMatrixOperator(MatrixOperator):
+    adjoint_lookups = 0
+
+    @property
+    def T(self):
+        type(self).adjoint_lookups += 1
+        return super().T
 
 
 def test_identity_repr():
@@ -148,10 +179,166 @@ def test_radon_composite_adjoint():
     gram = R.T * R
     gram_adjoint = gram.T
 
-    assert gram_adjoint._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION
+    assert (
+        gram_adjoint._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION
+    )
     assert [operand.adjoint for operand in gram_adjoint._operands] == [True, False]
     assert gram_adjoint.input_shape == gram.input_shape
     assert gram_adjoint.output_shape == gram.output_shape
+
+
+def test_identity_norm_estimate():
+    assert IDENTITY.norm_estimate() == pytest.approx(1.0)
+    assert (3 * IDENTITY).norm_estimate() == pytest.approx(3.0)
+
+
+def test_zero_norm_estimate():
+    assert ZERO.norm_estimate() == 0.0
+
+
+def test_matrix_operator_poweriteration_norm_estimate():
+    matrix = np.array([[1.0, 2.0], [3.0, -4.0], [5.0, 6.0]])
+    A = MatrixOperator(matrix, name="A")
+
+    estimate = A.norm_estimate(number_iterations=20, rng=np.random.default_rng(1))
+
+    assert estimate == pytest.approx(np.linalg.norm(matrix, ord=2))
+
+
+def test_complex_matrix_operator_norm_estimate_uses_conjugate_adjoint():
+    matrix = np.array([[1.0, 2.0j], [3.0 - 1.0j, -4.0], [5.0j, 6.0]])
+    A = MatrixOperator(matrix, name="A")
+
+    estimate = A.norm_estimate(
+        number_iterations=20,
+        dtype=np.complex128,
+        rng=np.random.default_rng(1),
+    )
+
+    assert estimate == pytest.approx(np.linalg.norm(matrix, ord=2))
+
+
+def test_scaled_matrix_operator_norm_estimate():
+    matrix = np.array([[1.0, 2.0], [3.0, -4.0], [5.0, 6.0]])
+    A = MatrixOperator(matrix, name="A")
+
+    estimate = (-2 * A).norm_estimate(
+        number_iterations=20,
+        rng=np.random.default_rng(1),
+    )
+
+    assert estimate == pytest.approx(2 * np.linalg.norm(matrix, ord=2))
+
+
+def test_poweriteration_reuses_adjoint_operator():
+    CountingAdjointMatrixOperator.adjoint_lookups = 0
+    A = CountingAdjointMatrixOperator(np.diag([3.0, 2.0, 1.0]), name="A")
+
+    A.norm_estimate(number_iterations=5, rng=np.random.default_rng(1))
+
+    assert CountingAdjointMatrixOperator.adjoint_lookups == 1
+
+
+@pytest.mark.parametrize(
+    "operator",
+    [MatrixOperator(np.eye(2), name="A"), IDENTITY, ZERO],
+)
+def test_norm_estimate_rejects_invalid_arguments(operator):
+    with pytest.raises(ValueError, match="Unknown norm-estimation algorithm"):
+        operator.norm_estimate(algorithm="invalid")  # type: ignore[arg-type]
+    for number_iterations in [0, -1, 1.5, True]:
+        with pytest.raises(ValueError, match="positive integer"):
+            operator.norm_estimate(
+                number_iterations=number_iterations  # type: ignore[arg-type]
+            )
+
+
+def test_norm_estimate_requires_input_shape():
+    A = Operator(name="A")
+
+    with pytest.raises(ValueError, match="without an input shape"):
+        A.norm_estimate()
+
+
+def test_composite_naive_norm_estimate_uses_triangle_and_submultiplicativity():
+    A = MatrixOperator(np.diag([3.0, 2.0]), name="A")
+    B = MatrixOperator(np.diag([5.0, 4.0]), name="B")
+
+    assert (A + B).norm_estimate(
+        number_iterations=20,
+        algorithm="naive",
+        rng=np.random.default_rng(1),
+    ) == pytest.approx(8.0)
+    assert (-2 * A * B).norm_estimate(
+        number_iterations=20,
+        algorithm="naive",
+        rng=np.random.default_rng(1),
+    ) == pytest.approx(30.0)
+
+
+def test_composite_poweriteration_norm_estimate_is_direct():
+    A = MatrixOperator(np.diag([3.0, 2.0]), name="A")
+    B = MatrixOperator(np.diag([5.0, 4.0]), name="B")
+
+    assert (A + B).norm_estimate(
+        number_iterations=20,
+        algorithm="poweriteration",
+        rng=np.random.default_rng(1),
+    ) == pytest.approx(8.0)
+
+
+def test_scaled_composite_product_poweriteration_norm_estimate():
+    left_matrix = np.array([[1.0, 2.0], [3.0, -4.0], [5.0, 6.0]])
+    right_matrix = np.array([[2.0, -1.0], [4.0, 3.0]])
+    A = MatrixOperator(left_matrix, name="A")
+    B = MatrixOperator(right_matrix, name="B")
+
+    estimate = (-2 * A * B).norm_estimate(
+        number_iterations=20,
+        rng=np.random.default_rng(1),
+    )
+
+    assert estimate == pytest.approx(
+        2 * np.linalg.norm(left_matrix @ right_matrix, ord=2)
+    )
+
+
+def test_radon_norm_estimate_matches_legacy_normest(monkeypatch):
+    ctx = cl.create_some_context(interactive=False)
+    queue = cl.CommandQueue(ctx)
+    R = Radon(image_domain=8, angles=5)
+    projection_settings = ProjectionSettings(
+        queue=queue,
+        geometry=RADON,
+        img_shape=R.image_domain.size,
+        angles=R.angles.angles,
+        angle_weights=R.angles.weights,
+        n_detectors=R.detectors.number,
+        image_width=float(R.image_domain.extent),
+        detector_width=float(R.detectors.extent),
+        midpoint_shift=R.image_domain.center,
+        detector_shift=R.detectors.center,
+    )
+
+    estimate = R.norm_estimate(
+        number_iterations=20,
+        dtype=np.float32,
+        queue=queue,
+        rng=np.random.default_rng(1),
+    )
+    legacy_rng = np.random.default_rng(1)
+    monkeypatch.setattr(
+        np.random,
+        "randn",
+        lambda *shape: legacy_rng.standard_normal(shape),
+    )
+    legacy_estimate = normest(
+        projection_settings,
+        number_iterations=20,
+        dtype=np.float32,
+    )
+
+    assert estimate == pytest.approx(legacy_estimate, rel=1e-5)
 
 
 def test_radon_integer_angles_use_half_circle_default():

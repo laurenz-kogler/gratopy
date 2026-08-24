@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import numpy as np
+import numpy.typing as npt
 
 from enum import Enum
-from typing import Any
-from numbers import Number
+from math import prod
+from numbers import Integral, Number
+from typing import Any, Literal
 from copy import deepcopy
 
 from gratopy.utilities import Numeric
@@ -184,7 +186,9 @@ class Operator:
                     adjoint = adjoint * operand
                 return np.conjugate(self.scalar) * adjoint
 
-            raise ValueError(f"Unknown arithmetic operation: {self._arithmetic_operation}")
+            raise ValueError(
+                f"Unknown arithmetic operation: {self._arithmetic_operation}"
+            )
 
         operator_copy = deepcopy(self)
         operator_copy._adjoint = not self._adjoint
@@ -210,6 +214,146 @@ class Operator:
                 self._operands[0].scalar = self._operands[0].scalar * value
         else:
             self._scalar = value
+
+    def norm_estimate(
+        self,
+        number_iterations: int = 50,
+        dtype: npt.DTypeLike = np.float32,
+        input_shape: tuple[int, ...] | None = None,
+        algorithm: Literal["poweriteration", "naive"] = "poweriteration",
+        queue: Any | None = None,
+        rng: np.random.Generator | None = None,
+        **kwargs: Any,
+    ) -> float:
+        """Estimate the operator norm.
+
+        Parameters
+        ----------
+        number_iterations:
+            Positive number of power-iteration updates.
+        dtype:
+            Data type of the random starting vector.
+        input_shape:
+            Shape of the starting vector. Defaults to :attr:`input_shape`.
+        algorithm:
+            ``"poweriteration"`` applies power iteration to ``self.T * self``.
+            ``"naive"`` combines power-iteration estimates for composite leaves
+            using the triangle inequality for sums and submultiplicativity for
+            products. Since the leaf norms are themselves estimates, the result
+            is a heuristic and not a guaranteed upper bound.
+        queue:
+            Optional backend-specific execution queue forwarded to operator
+            applications.
+        rng:
+            Random-number generator used to construct the starting vector.
+        """
+        if algorithm not in {"poweriteration", "naive"}:
+            raise ValueError(
+                "Unknown norm-estimation algorithm. Expected 'poweriteration' or 'naive'."
+            )
+        if (
+            not isinstance(number_iterations, Integral)
+            or isinstance(number_iterations, bool)
+            or number_iterations < 1
+        ):
+            raise ValueError("number_iterations must be a positive integer")
+        number_iterations = int(number_iterations)
+
+        exact_norm = self._exact_norm()
+        if exact_norm is not None:
+            return exact_norm
+
+        if algorithm == "naive" and self.is_composite():
+            child_norms = [
+                operand.norm_estimate(
+                    number_iterations=number_iterations,
+                    dtype=dtype,
+                    algorithm=algorithm,
+                    queue=queue,
+                    rng=rng,
+                    **kwargs,
+                )
+                for operand in self._operands
+            ]
+            scalar_magnitude = abs(float(self.scalar))
+            if self._arithmetic_operation == OperatorArithmeticOperation.ADDITION:
+                return scalar_magnitude * sum(child_norms)
+            if self._arithmetic_operation == OperatorArithmeticOperation.MULTIPLICATION:
+                return scalar_magnitude * prod(child_norms)
+            raise ValueError(
+                f"Unknown arithmetic operation: {self._arithmetic_operation}"
+            )
+
+        return self._power_iteration_norm_estimate(
+            number_iterations=number_iterations,
+            dtype=dtype,
+            input_shape=input_shape,
+            queue=queue,
+            rng=rng,
+            **kwargs,
+        )
+
+    def _exact_norm(self) -> float | None:
+        """Return an exact norm when one is available for this operator."""
+        return None
+
+    def _power_iteration_norm_estimate(
+        self,
+        number_iterations: int,
+        dtype: npt.DTypeLike,
+        input_shape: tuple[int, ...] | None,
+        queue: Any | None,
+        rng: np.random.Generator | None,
+        **kwargs: Any,
+    ) -> float:
+        if input_shape is None:
+            input_shape = self.input_shape
+        if input_shape is None:
+            raise ValueError(
+                "Cannot estimate the norm without an input shape. Set "
+                "operator.input_shape or pass input_shape explicitly."
+            )
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        x = np.asarray(rng.standard_normal(input_shape), dtype=dtype)
+        x_norm = self._vector_norm(x)
+        if x_norm == 0:
+            return 0.0
+        x = x / x_norm
+
+        estimate = 0.0
+        adjoint = self.T
+        for _ in range(number_iterations):
+            y = (
+                self.apply_to(x, queue=queue, **kwargs)
+                if queue is not None
+                else self.apply_to(x, **kwargs)
+            )
+            z = (
+                adjoint.apply_to(y, queue=queue, **kwargs)
+                if queue is not None
+                else adjoint.apply_to(y, **kwargs)
+            )
+            z_norm = adjoint._vector_norm(z)
+            if z_norm == 0:
+                return 0.0
+
+            # Since x is normalized, ||(A.T * A)x|| converges to the dominant
+            # eigenvalue of A.T * A. Its square root is the operator norm. This
+            # remains valid when T represents an adjoint for weighted inner
+            # products, as is the case for gratopy's projection operators.
+            estimate = float(np.sqrt(z_norm))
+            x = z / z_norm
+
+        return estimate
+
+    def _vector_norm(self, vector: Any) -> float:
+        """Compute a vector norm using this operator's array backend."""
+        if self.is_composite():
+            return self._operands[0]._vector_norm(vector)
+        return float(np.linalg.norm(vector))
 
     def apply_to(
         self,
@@ -357,6 +501,10 @@ class _IdentityOperator(Operator):
             return other
         return super().__mul__(other)
 
+    def _exact_norm(self) -> float:
+        """Return the exact norm of the identity operator."""
+        return abs(float(self.scalar))
+
     def apply_to(self, argument: Any, output: Any | None = None, **kwargs: Any) -> Any:
         """The identity operator does not change the input."""
         result = self.scalar * argument
@@ -388,6 +536,10 @@ class _ZeroOperator(Operator):
     @scalar.setter
     def scalar(self, value: Numeric):
         pass
+
+    def _exact_norm(self) -> float:
+        """Return the exact norm of the zero operator."""
+        return 0.0
 
     def apply_to(self, argument: Any, output: Any | None = None, **kwargs: Any) -> Any:
         """Applying the zero operator returns a zero-multiplied version of the input."""
