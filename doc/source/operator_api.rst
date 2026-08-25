@@ -127,7 +127,11 @@ operator:
 
 This explicit style is particularly useful when experimenting with geometry in
 Python code, because image domain, angles, and detector settings become
-first-class objects that can be reused and modified independently.
+immutable first-class values that can be safely reused by multiple operators.
+To change a detector or image setting, construct a new value, for example with
+:func:`dataclasses.replace`. ``Angles`` makes private copies of its input arrays
+and exposes them read-only so subsequent changes to caller-owned arrays cannot
+invalidate an operator's cached geometry.
 
 Extent placeholders
 -------------------

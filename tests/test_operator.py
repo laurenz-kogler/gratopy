@@ -593,20 +593,28 @@ def test_expression_nodes_return_terminal_events():
 
 
 def test_radon_placeholder_resolved_for_detector_extent():
+    detectors = Detectors(number=20, extent=ExtentPlaceholder.FULL)
     radon = Radon(
         image_domain=ImageDomain(size=16, extent=2.0),
         angles=10,
-        detectors=Detectors(number=20, extent=ExtentPlaceholder.FULL),
+        detectors=detectors,
     )
+
+    assert detectors.extent is ExtentPlaceholder.FULL
+    assert radon.detectors is not detectors
     assert isinstance(radon.detectors.extent, float)
     assert radon.detectors.extent > 0.0
 
 
 def test_radon_placeholder_resolved_for_image_extent():
+    image_domain = ImageDomain(size=16, extent=ExtentPlaceholder.FULL)
     radon = Radon(
-        image_domain=ImageDomain(size=16, extent=ExtentPlaceholder.FULL),
+        image_domain=image_domain,
         angles=10,
         detectors=Detectors(number=20, extent=2.0),
     )
+
+    assert image_domain.extent is ExtentPlaceholder.FULL
+    assert radon.image_domain is not image_domain
     assert isinstance(radon.image_domain.extent, float)
     assert radon.image_domain.extent > 0.0

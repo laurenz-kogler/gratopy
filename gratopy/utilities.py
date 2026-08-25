@@ -50,6 +50,7 @@ class GeometryType(Enum):
     FANBEAM = "fanbeam"
 
 
+@dataclass(frozen=True, eq=False)
 class Angles:
     r"""Angular sampling together with associated weights.
 
@@ -75,6 +76,10 @@ class Angles:
 
     **Notes**
 
+    Instances are immutable. Input arrays are copied during construction and
+    stored as read-only arrays, so changing the caller's arrays cannot alter an
+    existing angular sampling.
+
     The static constructors on this class provide a few common ways of
     constructing angular samplings:
 
@@ -86,22 +91,43 @@ class Angles:
       *natural* weights.
     """
 
+    angles: np.ndarray
+    weights: np.ndarray
+    half_circle: bool = False
+
     def __init__(
         self,
         angles: npt.ArrayLike,
         weights: npt.ArrayLike,
         half_circle: bool = False,
     ):
-        angles = np.asarray(angles)
-        weights = np.asarray(weights)
-        if len(angles) != len(weights):
+        angle_values = np.asarray(angles)
+        weight_values = np.asarray(weights)
+        angles_array = np.frombuffer(
+            angle_values.tobytes(),
+            dtype=angle_values.dtype,
+        ).reshape(angle_values.shape)
+        weights_array = np.frombuffer(
+            weight_values.tobytes(),
+            dtype=weight_values.dtype,
+        ).reshape(weight_values.shape)
+        if len(angles_array) != len(weights_array):
             raise ValueError("Angles and weights must have the same length.")
-        self.angles = angles
-        self.weights = weights
-        self.half_circle = half_circle
+
+        angles_array.setflags(write=False)
+        weights_array.setflags(write=False)
+        object.__setattr__(self, "angles", angles_array)
+        object.__setattr__(self, "weights", weights_array)
+        object.__setattr__(self, "half_circle", half_circle)
 
     def __repr__(self):
         return f"Angles({self.angles}, weights={self.weights})"
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[Angles], tuple[np.ndarray, np.ndarray, bool]]:
+        """Reconstruct through ``__init__`` to preserve read-only arrays."""
+        return type(self), (self.angles, self.weights, self.half_circle)
 
     def __len__(self):
         return len(self.angles)
@@ -133,8 +159,12 @@ class Angles:
         """
         max_angle = np.pi if half_circle else 2 * np.pi
         angles = Angles.sparse(number, half_circle=half_circle)
-        angles.weights = angles.weights * (max_angle / number)
-        return angles
+        weights = angles.weights * (max_angle / number)
+        return Angles(
+            angles=angles.angles,
+            weights=weights,
+            half_circle=half_circle,
+        )
 
     @staticmethod
     def uniform_interval(
@@ -181,8 +211,8 @@ class Angles:
         if not len(number_list) == len(start_list) == len(end_list):
             raise ValueError("All input lists must have the same length.")
 
-        angles = []
-        weights = []
+        angles: list[float] = []
+        weights: list[float] = []
 
         for n, start, end in zip(number_list, start_list, end_list):
             interval_angles = Angles.uniform_interval(
@@ -251,7 +281,7 @@ class Angles:
 
 
 # TODO: write tests for reversed in particular
-@dataclass
+@dataclass(frozen=True)
 class Detectors:
     """Detector discretization and physical placement.
 
@@ -277,6 +307,9 @@ class Detectors:
 
     **Notes**
 
+    Instances are immutable. Construct a new detector value when changing its
+    discretization or physical placement.
+
     In the experimental Radon operator, ``ExtentPlaceholder.FULL`` and
     ``ExtentPlaceholder.VALID`` can be used here to resolve the detector extent
     from a fixed image extent. Passing placeholders for both detector and image
@@ -295,17 +328,13 @@ class Detectors:
         center: float = 0.0,
         reversed: bool | None = None,
     ):
-        self.number = abs(number)
-        self.extent = extent
-        self.center = center
-
-        if reversed is None:
-            self.reversed = number < 0
-        else:
-            self.reversed = reversed
+        object.__setattr__(self, "number", abs(number))
+        object.__setattr__(self, "extent", extent)
+        object.__setattr__(self, "center", center)
+        object.__setattr__(self, "reversed", number < 0 if reversed is None else reversed)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ImageDomain:
     """Image grid and physical image extent.
 
@@ -326,6 +355,9 @@ class ImageDomain:
 
     **Notes**
 
+    Instances are immutable. Construct a new image-domain value when changing
+    its grid, extent, or center.
+
     In the experimental Radon operator, ``ExtentPlaceholder.FULL`` and
     ``ExtentPlaceholder.VALID`` can be used here to resolve the image extent
     from a fixed detector extent. Passing placeholders for both image and
@@ -345,9 +377,12 @@ class ImageDomain:
     ):
         if isinstance(size, int):
             size = (size, size)
-        self.size = size
-        self.extent = extent
-        self.center = center
+        else:
+            size = (size[0], size[1])
+        center = (center[0], center[1])
+        object.__setattr__(self, "size", size)
+        object.__setattr__(self, "extent", extent)
+        object.__setattr__(self, "center", center)
 
 
 # ---------------------------------------------------------------------------

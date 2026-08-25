@@ -35,6 +35,7 @@ import numpy.typing as npt
 import pyopencl as cl
 import pyopencl.array as clarray
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -176,7 +177,7 @@ class Radon(_OpenCLOperator):
             kernel_spec=kernel_spec,
         )
 
-        self.substitute_placeholder()
+        self._resolve_extent_placeholders()
         self._host_struct: dict[str, Any] | None = None
         self._device_struct: dict[tuple[cl.Context, np.dtype], dict[str, Any]] = {}
 
@@ -239,10 +240,12 @@ class Radon(_OpenCLOperator):
             )
         return True
 
-    def substitute_placeholder(self) -> None:
-        """Resolve extent placeholders to concrete numeric values."""
-        if isinstance(self.image_domain.extent, ExtentPlaceholder) and isinstance(
-            self.detectors.extent, ExtentPlaceholder
+    def _resolve_extent_placeholders(self) -> None:
+        """Resolve extent placeholders without mutating the input geometry."""
+        image_extent = self.image_domain.extent
+        detector_extent = self.detectors.extent
+        if isinstance(image_extent, ExtentPlaceholder) and isinstance(
+            detector_extent, ExtentPlaceholder
         ):
             raise NotImplementedError(
                 "Both the ImageDomain and Detectors use an ExtentPlaceholder. "
@@ -251,28 +254,29 @@ class Radon(_OpenCLOperator):
                 "automatically."
             )
 
-        if isinstance(self.image_domain.extent, ExtentPlaceholder):
+        if isinstance(image_extent, ExtentPlaceholder):
+            assert not isinstance(detector_extent, ExtentPlaceholder)
             Mx, My = self.image_domain.center
             Md = self.detectors.center
             Nx, Ny = self.image_domain.size
             c = Nx / Ny
-            Dd = float(self.detectors.extent)
+            Dd = float(detector_extent)
             M = (Md, Mx, My)
             full_circle = self._use_full_circle()
 
-            if self.image_domain.extent == ExtentPlaceholder.FULL:
+            if image_extent == ExtentPlaceholder.FULL:
                 if full_circle:
-                    result = full_image_given_detector_fullcircle(M, Dd, c)
+                    image_result = full_image_given_detector_fullcircle(M, Dd, c)
                 else:
-                    result = full_image_given_detector_halfcircle(M, Dd, c)
+                    image_result = full_image_given_detector_halfcircle(M, Dd, c)
             else:
                 if full_circle:
-                    result = valid_image_given_detector_fullcircle(M, Dd, c)
+                    image_result = valid_image_given_detector_fullcircle(M, Dd, c)
                 else:
-                    result = valid_image_given_detector_halfcircle(M, Dd, c)
+                    image_result = valid_image_given_detector_halfcircle(M, Dd, c)
 
-            if result is None:
-                if self.image_domain.extent == ExtentPlaceholder.FULL:
+            if image_result is None:
+                if image_extent == ExtentPlaceholder.FULL:
                     meaning = (
                         "FULL means the largest image extent such that every "
                         "ray through the image also hits the detector"
@@ -284,40 +288,45 @@ class Radon(_OpenCLOperator):
                         "the image"
                     )
                 raise ValueError(
-                    f"Cannot resolve ExtentPlaceholder.{self.image_domain.extent.name} "
+                    f"Cannot resolve ExtentPlaceholder.{image_extent.name} "
                     f"for the image domain ({meaning}): no such image extent "
                     f"exists with the given detector width Dd={Dd}, detector "
                     f"center Md={Md}, and image center ({Mx}, {My}). "
                     f"Consider increasing the detector width or adjusting the "
                     f"center offsets."
                 )
-            Dx, Dy = result
-            self.image_domain.extent = max(Dx, Dy)
+            Dx, Dy = image_result
+            self.state["image_domain"] = replace(
+                self.image_domain,
+                extent=max(Dx, Dy),
+            )
 
-        if isinstance(self.detectors.extent, ExtentPlaceholder):
+        if isinstance(detector_extent, ExtentPlaceholder):
+            assert not isinstance(image_extent, ExtentPlaceholder)
             Mx, My = self.image_domain.center
             Md = self.detectors.center
             Nx, Ny = self.image_domain.size
-            extent = float(self.image_domain.extent)
+            extent = float(image_extent)
             Dx = extent * Nx / max(Nx, Ny)
             Dy = extent * Ny / max(Nx, Ny)
             M = (Md, Mx, My)
             D = (Dx, Dy)
             full_circle = self._use_full_circle()
+            detector_result: float | None
 
-            if self.detectors.extent == ExtentPlaceholder.FULL:
+            if detector_extent == ExtentPlaceholder.FULL:
                 if full_circle:
-                    result = full_detector_given_image_fullcircle(M, D)
+                    detector_result = full_detector_given_image_fullcircle(M, D)
                 else:
-                    result = full_detector_given_image_halfcircle(M, D)
+                    detector_result = full_detector_given_image_halfcircle(M, D)
             else:
                 if full_circle:
-                    result = valid_detector_given_image_fullcircle(M, D)
+                    detector_result = valid_detector_given_image_fullcircle(M, D)
                 else:
-                    result = valid_detector_given_image_halfcircle(M, D)
+                    detector_result = valid_detector_given_image_halfcircle(M, D)
 
-            if result is None:
-                if self.detectors.extent == ExtentPlaceholder.FULL:
+            if detector_result is None:
+                if detector_extent == ExtentPlaceholder.FULL:
                     meaning = (
                         "FULL means the smallest detector width such that "
                         "every ray through the image also hits the detector"
@@ -329,14 +338,17 @@ class Radon(_OpenCLOperator):
                         "the image"
                     )
                 raise ValueError(
-                    f"Cannot resolve ExtentPlaceholder.{self.detectors.extent.name} "
+                    f"Cannot resolve ExtentPlaceholder.{detector_extent.name} "
                     f"for the detector ({meaning}): no such detector width "
                     f"exists with image dimensions ({Dx}, {Dy}), detector "
                     f"center Md={Md}, and image center ({Mx}, {My}). "
                     f"Consider increasing the image extent or adjusting the "
                     f"center offsets."
                 )
-            self.detectors.extent = result
+            self.state["detectors"] = replace(
+                self.detectors,
+                extent=detector_result,
+            )
 
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         if self._host_struct is not None:
