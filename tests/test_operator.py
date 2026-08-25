@@ -262,6 +262,8 @@ def test_radon_forward_adjoint_and_rebuilt_gram_share_device_cache(monkeypatch):
 
     assert cache_misses == 1
     assert len(R._device_struct) == 1
+    device_struct = next(iter(R._device_struct.values()))
+    assert set(device_struct) == {"ofs", "geometry"}
 
 
 def test_identity_norm_estimate():
@@ -473,8 +475,8 @@ def test_radon_numpy_coercion_clarray_input():
     assert sinogram.shape == (R.detectors.number, n_angles)
 
 
-def test_radon_numpy_coercion_reuses_queue():
-    """Test that Radon.apply_to() reuses the queue from projection_settings."""
+def test_radon_numpy_coercion_reuses_last_queue():
+    """Test that Radon.apply_to() reuses its last explicit queue."""
     ctx = cl.create_some_context(interactive=False)
     queue = cl.CommandQueue(ctx)
 
@@ -484,11 +486,10 @@ def test_radon_numpy_coercion_reuses_queue():
 
     img_np = np.zeros((Nx, Nx), dtype=np.float32)
 
-    # First call with explicit queue
+    # First call records the explicit queue.
     R.apply_to(img_np, queue=queue)
-    assert R.projection_settings is not None
 
-    # Second call without queue should reuse the stored queue
+    # Second call without a queue reuses the recorded queue.
     sinogram2 = R.apply_to(img_np)
     assert isinstance(sinogram2, clarray.Array)
 

@@ -36,7 +36,6 @@ import pyopencl as cl
 import pyopencl.array as clarray
 
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from gratopy.gratopy import radon_struct
@@ -178,7 +177,6 @@ class Radon(_OpenCLOperator):
         )
 
         self.substitute_placeholder()
-        self.projection_settings: SimpleNamespace | None = None
         self._host_struct: dict[str, Any] | None = None
         self._device_struct: dict[tuple[cl.Context, np.dtype], dict[str, Any]] = {}
 
@@ -195,7 +193,6 @@ class Radon(_OpenCLOperator):
     def __getstate__(self) -> dict[str, Any]:
         """Return pickle/deepcopy state without live OpenCL runtime objects."""
         state = super().__getstate__()
-        state["projection_settings"] = None
         state["_host_struct"] = None
         state["_device_struct"] = {}
         return state
@@ -371,24 +368,16 @@ class Radon(_OpenCLOperator):
         assert self._host_struct is not None
         ofs = self._host_struct["ofs_dict"][dtype]
         geometry = self._host_struct["geo_dict"][dtype]
-        angle_weights = self._host_struct["angle_diff_dict"][dtype]
 
         ofs_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, ofs.nbytes)
         geometry_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, geometry.nbytes)
-        angle_weights_buf = cl.Buffer(
-            queue.context,
-            cl.mem_flags.READ_ONLY,
-            angle_weights.nbytes,
-        )
 
         cl.enqueue_copy(queue, ofs_buf, ofs.data).wait()
         cl.enqueue_copy(queue, geometry_buf, geometry.data).wait()
-        cl.enqueue_copy(queue, angle_weights_buf, angle_weights.data).wait()
 
         device_struct = {
             "ofs": ofs_buf,
             "geometry": geometry_buf,
-            "angle_weights": angle_weights_buf,
         }
         self._device_struct[cache_key] = device_struct
         return device_struct
@@ -411,7 +400,6 @@ class Radon(_OpenCLOperator):
         **kwargs: Any,
     ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
         queue = self._infer_queue(argument=argument, output=output, queue=queue)
-        self.projection_settings = SimpleNamespace(queue=queue)
         return super().apply_to(
             argument,
             output=output,
@@ -428,7 +416,6 @@ class Radon(_OpenCLOperator):
         **kwargs: Any,
     ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
         queue = self._infer_queue(argument=argument, output=output, queue=queue)
-        self.projection_settings = SimpleNamespace(queue=queue)
         return super().apply_adjoint_to(
             argument,
             output=output,
