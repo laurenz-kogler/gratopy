@@ -8,4 +8,4 @@ from .base import (
     ScaledOperator,
     SumOperator,
 )
-from .opencl import OpenCLKernelSpec
+from .opencl import OpenCLKernelSpec, invalidate_kernel_cache

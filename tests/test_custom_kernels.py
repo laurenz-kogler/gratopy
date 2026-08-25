@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import gc
+import weakref
+from threading import Thread
+
 import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
 
 from pathlib import Path
 
-from gratopy.operator.opencl import OpenCLKernelSpec, _OpenCLOperator
+from gratopy.operator import invalidate_kernel_cache
+from gratopy.operator.opencl import OpenCLKernelSpec, _OpenCLOperator, _PROGRAM_CACHE
 
 
 TEST_AFFINE_KERNEL = Path(__file__).parent / "affine.cl"
@@ -68,6 +73,73 @@ def test_custom_kernel_spec_adjoint_kernel_is_used():
 
     result = operator.T.apply_to(host_input, queue=queue)
     np.testing.assert_allclose(result.get(), expected)
+
+
+def test_program_bundle_is_shared_while_operators_are_alive():
+    invalidate_kernel_cache()
+    ctx = cl.create_some_context(interactive=False)
+    queue = cl.CommandQueue(ctx)
+    shape = (4, 5)
+    op1 = AffineOperator(shape=shape)
+    op2 = AffineOperator(shape=shape)
+
+    op1.apply_to(np.ones(shape, dtype=np.float32), queue=queue)
+    op2.apply_to(np.ones(shape, dtype=np.float32), queue=queue)
+
+    lease_key = (ctx, True)
+    bundle1 = op1._program_bundles[lease_key]
+    bundle2 = op2._program_bundles[lease_key]
+    bundle_ref = weakref.ref(bundle1)
+
+    assert bundle1 is bundle2
+    assert len(_PROGRAM_CACHE) == 1
+
+    del bundle1, bundle2, op1
+    gc.collect()
+    assert bundle_ref() is not None
+
+    del op2
+    gc.collect()
+    assert bundle_ref() is None
+    assert len(_PROGRAM_CACHE) == 0
+
+
+def test_program_cache_invalidation_replaces_live_operator_lease():
+    invalidate_kernel_cache()
+    ctx = cl.create_some_context(interactive=False)
+    operator = AffineOperator(shape=(4, 5))
+
+    old_bundle = operator._get_program(ctx)
+    invalidate_kernel_cache()
+
+    assert len(_PROGRAM_CACHE) == 0
+
+    new_bundle = operator._get_program(ctx)
+
+    assert new_bundle is not old_bundle
+    assert new_bundle.generation > old_bundle.generation
+    assert len(_PROGRAM_CACHE) == 1
+
+
+def test_program_bundle_uses_thread_local_kernel_instances():
+    invalidate_kernel_cache()
+    ctx = cl.create_some_context(interactive=False)
+    operator = AffineOperator(shape=(4, 5))
+    bundle = operator._get_program(ctx)
+    kernel_name = operator._kernel_name(
+        dtype=np.float32,
+        output_order="F",
+        input_order="F",
+    )
+    main_kernel = bundle.kernel(kernel_name)
+    worker_kernels = []
+
+    thread = Thread(target=lambda: worker_kernels.append(bundle.kernel(kernel_name)))
+    thread.start()
+    thread.join()
+
+    assert bundle.kernel(kernel_name) is main_kernel
+    assert worker_kernels[0] is not main_kernel
 
 
 def test_custom_kernel_spec_cache_isolation_by_source_signature():

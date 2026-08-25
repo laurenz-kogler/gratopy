@@ -220,6 +220,32 @@ This separation keeps the generic algebra in :mod:`gratopy.operator.base`
 backend-agnostic while concentrating OpenCL-specific behavior in a gratopy-
 specific internal layer.
 
+Compiled-program lifecycle
+--------------------------
+
+Compiled OpenCL programs are shared across concrete operators using the same
+context, kernel source, build options, and template-expansion mode. The global
+registry retains these program bundles weakly; each operator that has actually
+used a bundle retains a strong runtime lease. Consequently, equivalent live
+operators share compilation work, while a bundle is released automatically
+after its last operator lease disappears. Adjoint and composite expressions
+retain their concrete leaves and therefore participate in the same lifecycle.
+
+Kernel instances are local to each calling thread because OpenCL kernel
+arguments are mutable. Threads share the compiled program but not argument
+state.
+
+The registry can be invalidated explicitly when required:
+
+.. code-block:: python
+
+    from gratopy.operator import invalidate_kernel_cache
+
+    invalidate_kernel_cache()
+
+Live operators acquire newly compiled bundles on their next application.
+Invocations already in progress may finish with their existing program.
+
 Custom kernels
 --------------
 
