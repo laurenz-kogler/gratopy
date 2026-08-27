@@ -60,7 +60,6 @@ The full list of requirements can be found in [`pyproject.toml`](/pyproject.toml
 We refer to the extensive [documentation](https://gratopy.readthedocs.io/), in particular to the [getting started](https://gratopy.readthedocs.io/en/latest/getting_started.html) guide, the new [operator syntax](https://gratopy.readthedocs.io/en/latest/operator_api.html) page, as well as to the test files for the [Radon transform](https://gratopy.readthedocs.io/en/latest/_modules/test_radon.html) and [fanbeam transform](https://gratopy.readthedocs.io/en/latest/_modules/test_fanbeam.html). The following [rudimentary example](https://gratopy.readthedocs.io/en/latest/getting_started.html#first-example-radon-transform) is also included in the documentation.
 
 ```python
-
 # initial import
 import numpy as np
 import pyopencl as cl
@@ -80,11 +79,12 @@ ctx = cl.create_some_context()
 queue = cl.CommandQueue(ctx)
 
 # create phantom as test image (a pyopencl.array.Array of dimensions (Nx, Nx))
-phantom = gratopy.phantom(queue,Nx)
+phantom = gratopy.phantom(queue, Nx)
 
 # create suitable projectionsettings
-PS = gratopy.ProjectionSettings(queue, gratopy.RADON, phantom.shape,
-                                number_angles, number_detectors)
+PS = gratopy.ProjectionSettings(
+    queue, gratopy.RADON, phantom.shape, number_angles, number_detectors
+)
 
 # compute forward projection and backprojection of created sinogram
 # results are pyopencl arrays
@@ -107,7 +107,7 @@ plt.show()
 ```
 
 ### Experimental operator syntax
-Gratopy also provides an **experimental** operator-based API for Radon transforms via `gratopy.operator.Radon`. This interface supports operator algebra such as adjoints and compositions, for example `R.T * R`, and can also be paired with custom OpenCL kernels for experimentation. As this interface is still experimental, backward-incompatible changes may still occur without a full deprecation cycle.
+Gratopy also provides an **experimental** operator API with parallel-beam and fan-beam projections. In addition to `gratopy.operator.Radon` and `gratopy.operator.Fanbeam`, it includes ray-driven and strip-driven variants for kernel experimentation. This interface supports operator algebra such as adjoints and compositions, for example `R.T * R`. NumPy inputs require an explicit OpenCL queue on every application; device-array inputs carry their queue and support the shorter `R * image` syntax. As this interface is still experimental, backward-incompatible changes may still occur without a full deprecation cycle.
 
 ```python
 import numpy as np

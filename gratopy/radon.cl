@@ -168,7 +168,7 @@ __kernel void radon_\my_variable_type_\order1\order2(
 // 			img:  Pointer to array representing image (to be computed)
 //			      of dimensions Nx times Ny times Nz
 //                            (img_shape=Nx times Ny)
-//			sino: Pointer to array representing sinogram (to be 
+//			sino: Pointer to array representing sinogram (to be
 //                            transformed) with detector-dimension times
 //                            angle-dimension times z dimension
 //                      ofs:  Buffer containing geometric informations concerning the
@@ -343,7 +343,7 @@ __kernel void single_line_radon_\my_variable_type_\order1\order2(
 // Helper function for ray-driven transforms
 real ray_weightfkt_\my_variable_type_\order1\order2(real t,real kappa,
     real s_under,real s_upper,real difference){
-  
+
   real rhs=0;
   real epsilon =0.0001;
   if ( fabs(difference)<(epsilon*s_under) && (fabs(t)<s_upper*(1+epsilon)))
@@ -476,15 +476,15 @@ __kernel void radon_ray_\my_variable_type_\order1\order2(
     for (int x = x_low; x <= x_high; x++) {
       // anterpolation weight via normal distance
       real zz = x * o.x + d;
-      
+
       real weight=0;
       weight = ray_weightfkt_\my_variable_type_\order1\order2(zz,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference);
 	  if ( (a==45) && (ss==300))
 	  {
 	  // printf ("Parameters: p=%d, x=%d, y=%d, z=%f, upper=%f , under=%f, difference=%f, weigth=%f \n", ss,x,y, zz,s_upper*delta_xi,s_under*delta_xi,difference*delta_xi, weight);
 	   }
-  
-      
+
+
       if (weight > (real)0.) {
         acc += weight * img[0];
       }
@@ -531,8 +531,8 @@ __kernel void radon_ray_ad_\my_variable_type_\order1\order2(
   size_t x = get_global_id(0);
   size_t y = get_global_id(1);
   size_t z = get_global_id(2);
-  
-  
+
+
     // Extract scales
   const float delta_x = Geometryinformation[0];
   const float delta_xi = Geometryinformation[1];
@@ -550,11 +550,11 @@ __kernel void radon_ray_ad_\my_variable_type_\order1\order2(
   for (int a = 0; a < Na; a++) {
     // Extract angular dimensions
     real8 o = ofs[a];
-    
+
     real s_under = fabs ( fabs(o.x) - fabs(o.y) )/2.;
     real s_upper = fabs ( fabs(o.x) + fabs(o.y) )/2.;
     real difference = s_upper - s_under;
-    
+
     real Delta_phi = o.s4; // angle_width asociated to the angle
 
     // compute detector position associated to (x,y) and phi=a
@@ -563,13 +563,13 @@ __kernel void radon_ray_ad_\my_variable_type_\order1\order2(
     // compute adjacent detector positions
     int sm = floor(s);
     //int sp = sm + 1;
-    
+
     int s_low = floor(s-s_upper*1.01);
     int s_high = ceil(s+s_upper*1.01);
-    
+
     s_low=max(s_low,0);
     s_high=min(s_high,Ns-1);
-  
+
 	real acc_local=0;
 	for (int p=s_low;p<=s_high;p++)
 	{
@@ -587,7 +587,7 @@ __kernel void radon_ray_ad_\my_variable_type_\order1\order2(
 }
 
 
-// Strip Radon Helper functions 
+// Strip Radon Helper functions
 real proj_on_interval_\my_variable_type_\order1\order2(real x,real y,real z)
 {//Projects the value of z onto the interval [x,y]
 return max(x,min(y,z));
@@ -639,7 +639,7 @@ return val_central+val_left+val_right;
 }
 
 
-// Strip-driven Radon Transform  
+// Strip-driven Radon Transform
 // Computes the forward projection in parallel beam geometry for a given image.
 // the \my_variable_type_\order1\order2 suffix sets the kernel to the suitable
 // precision, contiguity of the sinogram, contiguity of image.
@@ -676,7 +676,7 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
 
 
 
-  
+
   // Extract scales
   const float delta_x = Geometryinformation[0];
   const float delta_xi = Geometryinformation[1];
@@ -692,7 +692,7 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
   real s_upper = fabs ( fabs(o.x) + fabs(o.y) )/2.;
   real difference = s_upper - s_under;
   real inv_difference = 1.0/difference;
- 
+
 
   // Dummy variable for switching from horizontal to vertical lines
   int Nxx = Nx;
@@ -749,19 +749,19 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
     for (int x = x_low; x <= x_high; x++) {
       // anterpolation weight via normal distance
       real zz = x * o.x + d;
-      
+
       real weight=0;
       real weight1 = strip_weightfkt_\my_variable_type_\order1\order2(zz-0.5,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference,inv_difference,delta_x/delta_xi);
       real weight2 = strip_weightfkt_\my_variable_type_\order1\order2(zz+0.5,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference,inv_difference,delta_x/delta_xi);
-      
+
       weight = weight2-weight1;
-	  
+
 	  if ( (a==900) && (ss==2000))
 	  {
 	  // printf ("### Weight=%f,\n",  weight);
 	   }
-  
-      
+
+
       //if (weight > (real)0.) {
         acc += weight * img[0];
       //}
@@ -780,7 +780,7 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
       acc * delta_x * delta_x / delta_xi;
 }
 
-// Strip-driven Radon backprojection ##### (NOT IMPLEMENTED YET)
+// Strip-driven Radon backprojection
 // Computes the backprojection projection in parallel beam geometry for a given
 // image. the \my_variable_type_\order1\order2 suffix sets the kernel to the
 // suitable precision, contiguity of the sinogram, contiguity of image.
@@ -803,9 +803,9 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
 __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
     __global real *img, __global real *sino, __constant real8 *ofs,
     __constant real *Geometryinformation) {
-    
-    
-   
+
+
+
   // Extract dimensions
   size_t Nx = get_global_size(0);
   size_t Ny = get_global_size(1);
@@ -817,8 +817,8 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
   size_t x = get_global_id(0);
   size_t y = get_global_id(1);
   size_t z = get_global_id(2);
-  
-  
+
+
     // Extract scales
   const float delta_x = Geometryinformation[0];
   const float delta_xi = Geometryinformation[1];
@@ -836,12 +836,12 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
   for (int a = 0; a < Na; a++) {
     // Extract angular dimensions
     real8 o = ofs[a];
-    
+
     real s_under = fabs ( fabs(o.x) - fabs(o.y) )/2.;
     real s_upper = fabs ( fabs(o.x) + fabs(o.y) )/2.;
     real difference = s_upper - s_under;
     real inv_difference = 1.0/difference;
-    
+
     real Delta_phi = o.s4; // angle_width asociated to the angle
 
     // compute detector position associated to (x,y) and phi=a
@@ -850,7 +850,7 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
     // compute adjacent detector positions
     //int sm = floor(s);
     //int sp = sm + 1;
-    
+
     // minimal enclosing integer range (ceil/floor instead of floor/ceil) -> no
     // extra zero-weight detector pixel per side. The +-0.5 is the strip's box
     // half-width; the *1.01 cushion is kept for boundary robustness.
@@ -869,7 +869,7 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
 		real weight=0;
 		real weight1 = strip_weightfkt_\my_variable_type_\order1\order2(zz-0.5,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference,inv_difference,delta_x/delta_xi);
 		real weight2 = strip_weightfkt_\my_variable_type_\order1\order2(zz+0.5,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference,inv_difference,delta_x/delta_xi);
-      
+
 		weight = weight2-weight1;
 
 		acc_local += weight * sino[pos_sino_\order2(p, a, 0, Ns, Na, Nz)];
@@ -889,4 +889,3 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
   // the diagonal Nx==Ns.
   img[pos_img_\order1(x, y, z, Nx, Ny, Nz)] = acc;
 }
-

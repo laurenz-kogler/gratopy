@@ -15,7 +15,9 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from threading import RLock, local
+from typing import Any, Callable, Literal
+from weakref import WeakValueDictionary
 
 import numpy as np
 import numpy.typing as npt
@@ -139,20 +141,107 @@ class OpenCLKernelSpec:
         """Return the source code of all configured kernel files."""
         return tuple(Path(path).read_text() for path in self.paths)
 
-    @property
-    def signature(self) -> str:
-        """Return a content-based signature used for program cacheing."""
+    def source_snapshot(self) -> tuple[tuple[str, ...], str]:
+        """Read the configured sources and return them with their signature."""
+        sources = self.read_sources()
         digest = hashlib.sha256()
         digest.update(self.base_name.encode())
         for option in self.build_options:
             digest.update(b"\0")
             digest.update(option.encode())
-        for path, source in zip(self.paths, self.read_sources()):
+        for path, source in zip(self.paths, sources):
             digest.update(b"\0")
             digest.update(path.encode())
             digest.update(b"\0")
             digest.update(source.encode())
-        return digest.hexdigest()
+        return sources, digest.hexdigest()
+
+    @property
+    def signature(self) -> str:
+        """Return a content-based signature used for program cacheing."""
+        return self.source_snapshot()[1]
+
+
+_ProgramCacheKey = tuple[cl.Context, str, bool]
+_ProgramLeaseKey = tuple[cl.Context, bool]
+
+
+class _ProgramBundle:
+    """Compiled program shared by operators through strong runtime leases."""
+
+    def __init__(
+        self,
+        *,
+        cache_key: _ProgramCacheKey,
+        generation: int,
+        program: cl.Program,
+    ) -> None:
+        self.cache_key = cache_key
+        self.generation = generation
+        self.program = program
+        self._thread_state = local()
+
+    def kernel(self, name: str) -> cl.Kernel:
+        """Return a kernel instance local to the calling thread."""
+        kernels = getattr(self._thread_state, "kernels", None)
+        if kernels is None:
+            kernels = {}
+            self._thread_state.kernels = kernels
+
+        kernel = kernels.get(name)
+        if kernel is None:
+            kernel = cl.Kernel(self.program, name)
+            kernels[name] = kernel
+        return kernel
+
+
+class _ProgramCache:
+    """Weak registry interning compiled OpenCL program bundles."""
+
+    def __init__(self) -> None:
+        self._bundles: WeakValueDictionary[_ProgramCacheKey, _ProgramBundle] = (
+            WeakValueDictionary()
+        )
+        self._generation = 0
+        self._lock = RLock()
+
+    @property
+    def generation(self) -> int:
+        """Return the current invalidation generation."""
+        with self._lock:
+            return self._generation
+
+    def acquire(
+        self,
+        cache_key: _ProgramCacheKey,
+        build: Callable[[], cl.Program],
+    ) -> _ProgramBundle:
+        """Return a shared bundle, compiling it once on a cache miss."""
+        with self._lock:
+            bundle = self._bundles.get(cache_key)
+            if bundle is not None:
+                return bundle
+
+            bundle = _ProgramBundle(
+                cache_key=cache_key,
+                generation=self._generation,
+                program=build(),
+            )
+            self._bundles[cache_key] = bundle
+            return bundle
+
+    def invalidate(self) -> None:
+        """Invalidate all entries while allowing active leases to finish."""
+        with self._lock:
+            self._generation += 1
+            self._bundles.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._bundles)
+
+
+_PROGRAM_CACHE = _ProgramCache()
 
 
 class _OpenCLOperator(Operator):
@@ -163,8 +252,6 @@ class _OpenCLOperator(Operator):
     deciding which kernels to load.
     """
 
-    _PROGRAM_CACHE: dict[tuple[cl.Context, str, bool], dict[str, cl.Kernel]] = {}
-
     def __init__(
         self,
         *,
@@ -174,7 +261,7 @@ class _OpenCLOperator(Operator):
     ):
         super().__init__(name=name, **operator_kwargs)
         self.kernel_spec = kernel_spec or self._default_kernel_spec()
-        self._last_queue: cl.CommandQueue | None = None
+        self._program_bundles: dict[_ProgramLeaseKey, _ProgramBundle] = {}
 
     def _default_kernel_spec(self) -> OpenCLKernelSpec:
         """Return the default kernel spec for this operator.
@@ -185,9 +272,9 @@ class _OpenCLOperator(Operator):
         raise NotImplementedError("Concrete OpenCL operators must define a kernel spec")
 
     def __getstate__(self) -> dict[str, Any]:
-        """Return pickle/deepcopy state without live OpenCL queue handles."""
-        state = self.__dict__.copy()
-        state["_last_queue"] = None
+        """Return pickle/deepcopy state without live OpenCL program leases."""
+        state = super().__getstate__()
+        state["_program_bundles"] = {}
         return state
 
     def _infer_queue(
@@ -198,19 +285,13 @@ class _OpenCLOperator(Operator):
     ) -> cl.CommandQueue:
         """Infer the queue to use for computation."""
         if queue is not None:
-            self._last_queue = queue
             return queue
 
         if isinstance(argument, clarray.Array) and argument.queue is not None:
-            self._last_queue = argument.queue
             return argument.queue
 
         if isinstance(output, clarray.Array) and output.queue is not None:
-            self._last_queue = output.queue
             return output.queue
-
-        if self._last_queue is not None:
-            return self._last_queue
 
         raise ValueError(
             "No OpenCL queue available. Either pass an explicit queue, provide "
@@ -259,33 +340,54 @@ class _OpenCLOperator(Operator):
         """Return whether any device in the context supports double precision."""
         return any(device.double_fp_config for device in context.devices)
 
-    def _build_code(self, context: cl.Context, two_orders: bool = True) -> str:
+    def _build_code(
+        self,
+        context: cl.Context,
+        two_orders: bool = True,
+        sources: tuple[str, ...] | None = None,
+    ) -> str:
         """Build OpenCL source code from the configured kernel spec."""
         dtypes = ["float"]
         if self._supports_double_precision(context):
             dtypes.append("double")
+        if sources is None:
+            sources = self.kernel_spec.read_sources()
 
         return "".join(
             _expand_gratopy_template(source, dtypes=dtypes, two_orders=two_orders)
-            for source in self.kernel_spec.read_sources()
+            for source in sources
         )
 
     def _get_program(
         self,
         context: cl.Context,
         two_orders: bool = True,
-    ) -> dict[str, cl.Kernel]:
-        """Compile kernels for the given context if necessary and return them."""
-        cache_key = (context, self.kernel_spec.signature, two_orders)
-        if cache_key in self._PROGRAM_CACHE:
-            return self._PROGRAM_CACHE[cache_key]
+    ) -> _ProgramBundle:
+        """Acquire a compiled program bundle for the given context."""
+        sources, signature = self.kernel_spec.source_snapshot()
+        cache_key = (context, signature, two_orders)
+        lease_key = (context, two_orders)
+        bundle = self._program_bundles.get(lease_key)
+        if (
+            bundle is not None
+            and bundle.cache_key == cache_key
+            and bundle.generation == _PROGRAM_CACHE.generation
+        ):
+            return bundle
 
-        code = self._build_code(context, two_orders=two_orders)
-        program = cl.Program(context, code)
-        program.build(options=list(self.kernel_spec.build_options))
-        kernels = {kernel.function_name: kernel for kernel in program.all_kernels()}
-        self._PROGRAM_CACHE[cache_key] = kernels
-        return kernels
+        def build() -> cl.Program:
+            code = self._build_code(
+                context,
+                two_orders=two_orders,
+                sources=sources,
+            )
+            program = cl.Program(context, code)
+            program.build(options=list(self.kernel_spec.build_options))
+            return program
+
+        bundle = _PROGRAM_CACHE.acquire(cache_key, build)
+        self._program_bundles[lease_key] = bundle
+        return bundle
 
     def _kernel_name(
         self,
@@ -314,44 +416,62 @@ class _OpenCLOperator(Operator):
         adjoint: bool = False,
     ) -> cl.Kernel:
         """Return the compiled projection kernel for a given execution mode."""
-        kernels = self._get_program(context, two_orders=True)
+        program = self._get_program(context, two_orders=True)
         kernel_name = self._kernel_name(
             dtype=dtype,
             output_order=output_order,
             input_order=input_order,
             adjoint=adjoint,
         )
-        return kernels[kernel_name]
+        return program.kernel(kernel_name)
 
-    def _expected_output_shape(self, argument_shape: tuple[int, ...]) -> tuple[int, ...]:
-        """Return the expected output shape for a given input shape."""
-        if self.input_shape is None or self.output_shape is None:
+    def _expected_output_shape(
+        self,
+        argument_shape: tuple[int, ...],
+        *,
+        adjoint: bool = False,
+    ) -> tuple[int, ...]:
+        """Return the expected output shape for an execution direction."""
+        input_shape = self.output_shape if adjoint else self.input_shape
+        output_shape = self.input_shape if adjoint else self.output_shape
+        if input_shape is None or output_shape is None:
             raise NotImplementedError(
                 "Concrete OpenCL operators must define _expected_output_shape() or "
                 "set input_shape/output_shape appropriately."
             )
 
-        extra_dims = argument_shape[len(self.input_shape) :]
-        return self.output_shape + extra_dims
+        extra_dims = argument_shape[len(input_shape) :]
+        return output_shape + extra_dims
 
-    def _validate_argument(self, argument: clarray.Array) -> None:
+    def _validate_argument(
+        self,
+        argument: clarray.Array,
+        *,
+        adjoint: bool = False,
+    ) -> None:
         """Validate an input argument before kernel execution."""
-        if self.input_shape is None:
+        input_shape = self.output_shape if adjoint else self.input_shape
+        if input_shape is None:
             return
 
-        if argument.shape[0 : len(self.input_shape)] != self.input_shape:
+        if argument.shape[0 : len(input_shape)] != input_shape:
             raise ValueError(
-                f"Input shape mismatch: expected {self.input_shape}, got {argument.shape}"
+                f"Input shape mismatch: expected {input_shape}, got {argument.shape}"
             )
 
     def _validate_output(
         self,
         output: clarray.Array,
         argument: clarray.Array,
+        *,
+        adjoint: bool = False,
     ) -> clarray.Array:
         """Validate and normalize an output array before kernel execution."""
         output = output.with_queue(argument.queue)
-        expected_shape = self._expected_output_shape(argument.shape)
+        expected_shape = self._expected_output_shape(
+            argument.shape,
+            adjoint=adjoint,
+        )
 
         if output.dtype != argument.dtype:
             raise ValueError(
@@ -362,6 +482,13 @@ class _OpenCLOperator(Operator):
                 f"Output shape mismatch: expected {expected_shape}, got {output.shape}"
             )
         return output
+
+    def _vector_norm(self, vector: Any) -> float:
+        """Compute the Euclidean norm of an OpenCL device array."""
+        if not isinstance(vector, clarray.Array):
+            return super()._vector_norm(vector)
+        squared_norm = clarray.vdot(vector, vector).get()
+        return float(np.sqrt(np.real(squared_norm)))
 
     def _kernel_arguments(
         self,
@@ -377,14 +504,16 @@ class _OpenCLOperator(Operator):
         output: clarray.Array,
         argument: clarray.Array,
         queue: cl.CommandQueue,
+        *,
+        adjoint: bool = False,
     ) -> cl.Kernel:
-        """Return the kernel used for standard OpenCL operator execution."""
+        """Return the kernel used for an OpenCL execution direction."""
         return self._get_projection_kernel(
             queue.context,
             dtype=argument.dtype,
             output_order=self._default_order(output),
             input_order=self._default_order(argument),
-            adjoint=getattr(self, "adjoint", False),
+            adjoint=adjoint,
         )
 
     def _global_shape(
@@ -395,34 +524,31 @@ class _OpenCLOperator(Operator):
         """Return the global shape used for kernel execution."""
         return output.shape
 
-    def apply_to(
+    def _apply_opencl(
         self,
         argument: Any,
-        output: Any | None = None,
-        queue: cl.CommandQueue | None = None,
-        return_event: bool = False,
-        **kwargs: Any,
+        output: Any | None,
+        queue: cl.CommandQueue | None,
+        return_event: bool,
+        *,
+        adjoint: bool,
     ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
-        """Standard OpenCL-backed operator execution pipeline.
-
-        Passing ``output`` lets callers provide a preallocated device array and
-        avoid allocating a new OpenCL array for the result.
-        """
+        """Execute one direction through the shared OpenCL pipeline."""
         queue = self._infer_queue(argument=argument, output=output, queue=queue)
         argument = self._coerce_argument(argument, queue)
-        self._validate_argument(argument)
+        self._validate_argument(argument, adjoint=adjoint)
 
         if output is None:
             output = self._allocate_output(
                 queue=queue,
-                shape=self._expected_output_shape(argument.shape),
+                shape=self._expected_output_shape(argument.shape, adjoint=adjoint),
                 dtype=argument.dtype,
                 order=self._default_order(argument),
                 allocator=argument.allocator,
             )
-        output = self._validate_output(output, argument)
+        output = self._validate_output(output, argument, adjoint=adjoint)
 
-        kernel = self._get_kernel(output, argument, queue)
+        kernel = self._get_kernel(output, argument, queue, adjoint=adjoint)
         event = self._invoke_kernel(
             kernel,
             queue,
@@ -433,12 +559,44 @@ class _OpenCLOperator(Operator):
             wait_for=output.events + argument.events,
         )
         output.add_event(event)
-        if self.scalar != 1:
-            output *= output.dtype.type(self.scalar)
 
         if return_event:
             return output, [event]
         return output
+
+    def apply_to(
+        self,
+        argument: Any,
+        output: Any | None = None,
+        queue: cl.CommandQueue | None = None,
+        return_event: bool = False,
+        **kwargs: Any,
+    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
+        """Apply the forward OpenCL kernel."""
+        return self._apply_opencl(
+            argument,
+            output,
+            queue,
+            return_event,
+            adjoint=False,
+        )
+
+    def apply_adjoint_to(
+        self,
+        argument: Any,
+        output: Any | None = None,
+        queue: cl.CommandQueue | None = None,
+        return_event: bool = False,
+        **kwargs: Any,
+    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
+        """Apply the adjoint OpenCL kernel."""
+        return self._apply_opencl(
+            argument,
+            output,
+            queue,
+            return_event,
+            adjoint=True,
+        )
 
     @staticmethod
     def _invoke_kernel(
@@ -455,5 +613,10 @@ class _OpenCLOperator(Operator):
 
 
 def invalidate_kernel_cache() -> None:
-    """Clear the internal operator OpenCL program cache."""
-    _OpenCLOperator._PROGRAM_CACHE.clear()
+    """Invalidate compiled programs used by experimental OpenCL operators.
+
+    Existing invocations may finish with their current programs. Live operators
+    acquire a fresh bundle on their next application, while bundles without any
+    remaining operator leases are released automatically.
+    """
+    _PROGRAM_CACHE.invalidate()

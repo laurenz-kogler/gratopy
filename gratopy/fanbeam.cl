@@ -570,7 +570,7 @@ __kernel void single_line_fanbeam_\my_variable_type_\order1\order2(
 // Helper function for ray-driven fanbeam transforms
 real fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(real t,real kappa,
     real s_under,real s_upper,real difference){
-  
+
   real rhs=0;
   real epsilon =0.0001;
   if ( fabs(difference)<(epsilon*s_under) && (fabs(t)<s_upper*(1+epsilon)))
@@ -660,15 +660,15 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
 
   // compute direction vector from source to detector pixels center.
   real2 dp = d0 + dl * (-midpoint_det + s) - q;
-  
+
   real norm = hypot(dp.x,dp.y);
-  
+
   dp = dp/norm;
-  
+
   real2 ortho = (real2) (-dp[1], dp[0]);
-	    
+
   real ss = (q.x*ortho.x+q.y*ortho.y)*delta_x;//+(ortho.x*midpoint.x+ortho.y*midpoint.y-midpoint_det)*delta_x; //True parameter s (in universal unit)
-  
+
   // Dummy variable for switching from horizontal to vertical lines
   int Nxx = Nx;
   int Nyy = Ny;
@@ -681,10 +681,10 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
 
     Nxx = Ny;
     Nyy = Nx;
-    
+
     midpoint = (real2) (midpoint.y,midpoint.x);
   }
-  
+
     // shift image to correct z-dimension (as this will remain fixed),
   // particularly relevant for "F" contiguity of image
   __global real *img0 = img + pos_img_\order2(0, 0, z, Nx, Ny, Nz);
@@ -697,22 +697,22 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
   real s_under = fabs ( fabs(ortho.x) - fabs(ortho.y) )/2. * delta_x;
   real s_upper = fabs ( fabs(ortho.x) + fabs(ortho.y) )/2. * delta_x;
   real difference = s_upper - s_under;
-  
+
     // accumulation variable
   real acc = (real)0.;
-  
+
     // for through the entire y dimension
 	for (int y = 0; y < Nyy; y++) {
     int x_low, x_high;
 
-    // project (0,y) onto detector minus position of detector 
+    // project (0,y) onto detector minus position of detector
     real d = (y-midpoint.y) *delta_x * ortho.y  - ss;
 
 
     // compute bounds
     x_low = (int)((-s_upper*1.01 - d) / ortho.x / delta_x + midpoint.x);
     x_high = (int)((s_upper*1.01 - d) / ortho.x / delta_x + midpoint.x);
-   
+
 
     // case the direction is decreasing switch high and low
     if (ortho.x < (real)0.) {
@@ -720,7 +720,7 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
       x_low = x_high;
       x_high = trade;
     }
-    
+
 
     // make sure x inside image dimensions
     x_low = max(x_low, 0);
@@ -740,7 +740,7 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
 
 		  real weight=0;
 		  weight = fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(zz,1/fabs(ortho.x),s_under,s_upper,difference);
-		  
+
 		  if (weight > (real)0.) {
 			acc += weight * img[0];
 		  }
@@ -844,7 +844,7 @@ __kernel void fanbeam_ray_ad_\my_variable_type_\order1\order2(
     real2 Ppm = P + (real2)((real)0.5, -(real)0.5);
     real2 Ppp = P + (real2)((real)0.5, (real)0.5);
 
-    //project corners onto the detector 
+    //project corners onto the detector
     real xi_mm = dot(d, Pmm - q) / dot(dd, Pmm - q) + midpoint_det;
     real xi_mp = dot(d, Pmp - q) / dot(dd, Pmp - q) + midpoint_det;
     real xi_pm = dot(d, Ppm - q) / dot(dd, Ppm - q) + midpoint_det;
@@ -888,4 +888,3 @@ __kernel void fanbeam_ray_ad_\my_variable_type_\order1\order2(
   //update img with computed value
   img[pos_img_\order1(xx, yy, z, Nx, Ny, Nz)] = acc * delta_xi;
 }
-

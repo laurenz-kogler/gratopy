@@ -2,8 +2,8 @@ Operator syntax
 ===============
 
 The operator API provides a more compositional interface to gratopy's
-projection operators. It is currently **experimental** and primarily focused on
-parallel-beam Radon transforms.
+projection operators. It is currently **experimental** and supports both
+parallel-beam and fan-beam transforms through several discretizations.
 
 The legacy :class:`gratopy.ProjectionSettings` API remains the main documented
 interface for the full feature set of gratopy. The operator API complements it
@@ -18,22 +18,27 @@ adjoint operators, and experimental kernels.
 
    Extent placeholders such as
    :class:`gratopy.utilities.ExtentPlaceholder` are supported experimentally
-   for Radon operators when exactly one of the image or detector extents is a
-   placeholder. Passing placeholders for both extents at once remains
-   unsupported and raises :class:`NotImplementedError`.
+   for parallel-beam operators when exactly one of the image or detector
+   extents is a placeholder. Fan-beam operators currently require numeric
+   extents.
 
 Current scope
 -------------
 
 The current operator API supports in particular:
 
-- the :class:`gratopy.operator.projection.Radon` operator,
+- pixel-driven :class:`gratopy.operator.projection.Radon` and
+  :class:`gratopy.operator.projection.Fanbeam` operators,
+- :class:`gratopy.operator.projection.RayDrivenRadon`,
+  :class:`gratopy.operator.projection.StripDrivenRadon`, and
+  :class:`gratopy.operator.projection.RayDrivenFanbeam` variants,
 - adjoints via :attr:`T`,
 - operator composition and arithmetic,
 - custom OpenCL kernels via :class:`gratopy.operator.opencl.OpenCLKernelSpec`.
 
-At the moment, the operator API should be understood as **Radon-first**.
-Fanbeam support is not yet implemented at the same level.
+All projection classes are concrete operator leaves. Their adjoints and
+compositions retain those leaves and share their geometry and OpenCL runtime
+caches.
 
 Quick example
 -------------
@@ -44,6 +49,7 @@ A Radon transform and its adjoint can be used as follows:
 
     import numpy as np
     import pyopencl as cl
+    import pyopencl.array as clarray
     import gratopy
 
     ctx = cl.create_some_context(interactive=False)
@@ -57,15 +63,56 @@ A Radon transform and its adjoint can be used as follows:
     sino = R.apply_to(img, queue=queue)
     backprojection = R.T.apply_to(sino)
 
-The same operations can be written with operator syntax:
+A fan-beam transform additionally receives its source-to-detector and
+source-to-origin distances:
 
 .. code-block:: python
 
-    sino = R * img
+    F = gratopy.operator.Fanbeam(
+        source_distances=(8.0, 4.0),
+        image_domain=Nx,
+        angles=360,
+    )
+    fan_sino = F.apply_to(img, queue=queue)
+    fan_backprojection = F.T.apply_to(fan_sino)
+
+The same operations can be written with operator syntax when the arrays
+already reside on the OpenCL device:
+
+.. code-block:: python
+
+    device_img = clarray.to_device(queue, img)
+    sino = R * device_img
     backprojection = R.T * sino
 
-When the input is a NumPy array, a queue is still required for the first
-application so that the data can be transferred to the device.
+Queue selection is deterministic and does not depend on earlier applications.
+An explicit ``queue=`` takes precedence; otherwise the queue is inferred from
+a device argument or device output. Consequently, every application to a
+NumPy array must either receive ``queue=`` explicitly or receive a
+caller-provided :class:`pyopencl.array.Array` output. The multiplication
+shorthand has no place to pass a queue and is therefore intended for device
+arrays.
+
+Output reuse and events
+-----------------------
+
+Applications allocate a result when ``output`` is omitted. Allocation-sensitive
+iterative code can provide a compatible device output instead:
+
+.. code-block:: python
+
+    output = clarray.empty(queue, R.output_shape, dtype=np.float32)
+    R.apply_to(device_img, output=output)
+
+Compositions forward ``output`` to their final operation, while sums write
+their first summand directly into it before accumulating the remaining terms.
+Composite intermediates may still be allocated internally. Reusing outputs is
+recommended in long iterative loops; retaining every newly returned output
+necessarily retains the corresponding device memory.
+
+OpenCL execution is asynchronous. Passing ``return_event=True`` returns
+``(result, events)`` with the result's current event list in addition to
+recording those events on the result array.
 
 Detailed geometry example
 -------------------------
@@ -127,7 +174,11 @@ operator:
 
 This explicit style is particularly useful when experimenting with geometry in
 Python code, because image domain, angles, and detector settings become
-first-class objects that can be reused and modified independently.
+immutable first-class values that can be safely reused by multiple operators.
+To change a detector or image setting, construct a new value, for example with
+:func:`dataclasses.replace`. ``Angles`` makes private copies of its input arrays
+and exposes them read-only so subsequent changes to caller-owned arrays cannot
+invalidate an operator's cached geometry.
 
 Extent placeholders
 -------------------
@@ -165,11 +216,24 @@ both the image and detector extents is unsupported and raises
 geometrically impossible for the supplied centers and fixed extent, construction
 raises :class:`ValueError`.
 
+Adjoint convention
+------------------
+
+Projection adjoints use the same weighted discretization as the legacy API.
+Angular quadrature weights from :class:`gratopy.utilities.Angles` are included
+in each backprojection kernel. Thus ``R.T`` and ``F.T`` denote adjoints with
+respect to gratopy's physical image and sinogram pairings; they are not
+generally plain Euclidean transposes of the unweighted forward-projection
+matrices.
+
 Operator algebra
 ----------------
 
-Operators inherit from :class:`gratopy.operator.base.Operator`, which supports
-basic arithmetic and composition. For example, one can form a Gram operator
+Operators inherit from :class:`gratopy.operator.base.Operator`, which builds
+non-mutating expression nodes for arithmetic, scaling, adjoints, and
+composition. Expression nodes retain references to their original operands;
+they do not copy concrete operators or their runtime caches. For example, one
+can form a Gram operator
 
 .. code-block:: python
 
@@ -183,7 +247,32 @@ and apply it to an image:
 
 This is one of the main motivations for the operator interface: projection
 operators can be combined with a syntax that mirrors the underlying linear
-algebra.
+algebra. The multiplication syntax is intentionally overloaded:
+
+- ``A * B`` composes two operators,
+- ``alpha * A`` and ``A * alpha`` scale an operator,
+- ``A * x`` applies an operator to a non-operator argument.
+
+Addition and subtraction construct sum expressions. Algebra creates dedicated
+expression nodes and never mutates or copies concrete leaves.
+
+Norm estimation
+---------------
+
+Every operator provides :meth:`gratopy.operator.base.Operator.norm_estimate`.
+The default ``"poweriteration"`` algorithm applies power iteration to
+``A.T * A`` and supports OpenCL operators via an explicit queue:
+
+.. code-block:: python
+
+    estimate = R.norm_estimate(queue=queue, number_iterations=30)
+
+The alternative ``"naive"`` algorithm combines leaf values structurally using
+the triangle inequality for sums and submultiplicativity of operator norms for
+compositions. These inequalities preserve certified upper bounds, but unknown
+leaf norms are currently obtained from finite power iterations and are not
+themselves certified upper bounds. The resulting combined value is therefore a
+heuristic unless certified bounds are available for every leaf.
 
 Class structure
 ---------------
@@ -196,21 +285,55 @@ backward-incompatible ways without a full deprecation cycle while the design is
 settling.
 
 :class:`gratopy.operator.base.Operator`
-    Provides generic operator arithmetic such as addition, scalar
-    multiplication, composition, and application.
+    Provides the common operator interface and constructs dedicated adjoint,
+    scale, sum, and composition expression nodes. Concrete operands are shared
+    across the expression tree rather than copied.
 
 :class:`gratopy.operator.opencl._OpenCLOperator`
     Internal helper base for OpenCL-backed operators. It implements shared
     execution plumbing such as queue inference, array coercion, output
     allocation, program cacheing, and kernel lookup.
 
-:class:`gratopy.operator.projection.Radon`
-    Concrete Radon transform operator. It owns its operator state,
-    geometry-specific preparation, and binds these to the OpenCL kernels.
+:class:`gratopy.operator.projection.Radon` and :class:`gratopy.operator.projection.Fanbeam`
+    Concrete projection operators. They own immutable geometry state,
+    geometry-specific preparation, and bindings to the OpenCL kernels. The
+    ray- and strip-driven classes are dedicated subclasses selecting alternate
+    kernel bundles while preserving the same execution and cache lifecycle.
 
 This separation keeps the generic algebra in :mod:`gratopy.operator.base`
 backend-agnostic while concentrating OpenCL-specific behavior in a gratopy-
 specific internal layer.
+
+Compiled-program lifecycle
+--------------------------
+
+Compiled OpenCL programs are shared across concrete operators using the same
+context, kernel source, build options, and template-expansion mode. The global
+registry retains these program bundles weakly; each operator that has actually
+used a bundle retains a strong runtime lease. Consequently, equivalent live
+operators share compilation work, while a bundle is released automatically
+after its last operator lease disappears. Adjoint and composite expressions
+retain their concrete leaves and therefore participate in the same lifecycle.
+
+Kernel instances are local to each calling thread because OpenCL kernel
+arguments are mutable. Threads share the compiled program but not argument
+state. This protects kernel argument setup, but it does not yet constitute a
+guarantee that complete operators can be applied concurrently: other lazy
+runtime caches still require a dedicated thread-safety pass.
+
+The registry can be invalidated explicitly when required:
+
+.. code-block:: python
+
+    from gratopy.operator import invalidate_kernel_cache
+
+    invalidate_kernel_cache()
+
+Live operators acquire newly compiled bundles on their next application.
+Invocations already in progress may finish with their existing program.
+Invalidation removes bundles from future lookup; an existing operator may keep
+its old lease alive until its next application or until the operator is
+released.
 
 Custom kernels
 --------------
@@ -244,12 +367,14 @@ The default execution pipeline performs, in order:
 
 1. queue inference,
 2. coercion of array-like inputs to :class:`pyopencl.array.Array`,
-3. input validation,
+3. direction-aware input validation,
 4. output allocation (if needed),
 5. output validation,
-6. kernel lookup,
-7. kernel invocation,
-8. multiplication by the operator scalar.
+6. forward or adjoint kernel lookup,
+7. kernel invocation.
+
+Scalar multiplication is represented by a dedicated expression node instead
+of mutating or copying the concrete OpenCL operator.
 
 Subclasses can adapt this behavior mostly via hooks instead of overriding the
 entire method.
@@ -271,18 +396,23 @@ Important hooks are:
 - :py:meth:`gratopy.operator.opencl._OpenCLOperator._global_shape`
   for customizing the OpenCL launch shape.
 
-In simple cases, a custom operator only needs to provide a kernel spec,
-`adjoint` / `T` behavior, and static input/output shapes.
+In simple cases, a custom operator only needs to provide a kernel spec and
+static input/output shapes. The shared OpenCL implementation dispatches the
+forward and adjoint kernels through :meth:`apply_to` and
+:meth:`apply_adjoint_to`; :attr:`T` is an adjoint expression wrapper around the
+same concrete operator and therefore shares its runtime caches.
 
 Limitations and status
 ----------------------
 
 The operator API is still evolving. In particular:
 
-- the focus is currently on :class:`gratopy.operator.projection.Radon`,
-- extent placeholders are currently supported experimentally for Radon
-  operators when exactly one of the image or detector extents is a placeholder,
-- higher-level solver interfaces are still centered around the legacy API.
+- extent placeholders are currently supported experimentally for parallel-beam
+  operators when exactly one of the image or detector extents is a placeholder;
+  fan-beam operators require numeric extents,
+- higher-level solver interfaces are still centered around the legacy API,
+- the alternative ray- and strip-driven kernels are experimental and may still
+  evolve as their numerical behavior is characterized across more devices.
 
 For the full and mature feature set of gratopy, the legacy API documented in
 :doc:`getting_started` and :doc:`functions` remains the main reference.

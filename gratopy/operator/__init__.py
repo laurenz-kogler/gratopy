@@ -5,5 +5,13 @@ from .projection import (
     RayDrivenRadon,
     StripDrivenRadon,
 )
-from .base import IDENTITY, ZERO
-from .opencl import OpenCLKernelSpec
+from .base import (
+    IDENTITY,
+    ZERO,
+    AdjointOperator,
+    CompositionOperator,
+    Operator,
+    ScaledOperator,
+    SumOperator,
+)
+from .opencl import OpenCLKernelSpec, invalidate_kernel_cache

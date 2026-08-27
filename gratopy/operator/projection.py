@@ -3,15 +3,15 @@
 This module contains concrete operator implementations for gratopy's
 experimental operator interface, most notably :class:`.Radon`.
 
-The focus is currently on a compositional, operator-style interface for Radon
-transforms and their adjoints. Fanbeam support is not yet implemented at the
-same level.
+The module provides compositional parallel-beam and fan-beam transforms,
+including pixel-, ray-, and strip-driven discretizations and their adjoints.
 
 Examples
 --------
 
 >>> import numpy as np
 >>> import pyopencl as cl
+>>> import pyopencl.array as clarray
 >>> import gratopy
 >>> ctx = cl.create_some_context(interactive=False)
 >>> queue = cl.CommandQueue(ctx)
@@ -22,9 +22,10 @@ Examples
 >>> backprojection = R.T.apply_to(sinogram)
 
 The same forward and adjoint applications can also be written via operator
-syntax:
+syntax when the arrays already reside on the OpenCL device:
 
->>> sinogram = R * img
+>>> device_img = clarray.to_device(queue, img)
+>>> sinogram = R * device_img
 >>> backprojection = R.T * sinogram
 """
 
@@ -35,9 +36,8 @@ import numpy.typing as npt
 import pyopencl as cl
 import pyopencl.array as clarray
 
-from copy import copy
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from gratopy.gratopy import fanbeam_struct, radon_struct
@@ -57,13 +57,15 @@ from gratopy.utilities import (
     valid_image_given_detector_halfcircle,
 )
 
+
 class Radon(_OpenCLOperator):
     """Parallel-beam Radon transform operator.
 
     This class provides the main entry point to gratopy's experimental
     operator-based projection interface. A :class:`Radon` object represents
-    either the forward projection operator or, when created through
-    :attr:`T`, its adjoint.
+    the forward projection operator. Accessing :attr:`T` creates an adjoint
+    expression wrapper that references the same :class:`Radon` instance and
+    shares its runtime caches.
 
     **Parameters**
 
@@ -95,10 +97,6 @@ class Radon(_OpenCLOperator):
 
         Plain integer inputs are converted to
         :class:`~gratopy.utilities.Detectors` with default extent handling.
-    ``adjoint``:
-        If ``False`` (the default), construct the forward Radon transform.
-        If ``True``, construct the adjoint operator directly. In practice, the
-        adjoint is typically accessed via :attr:`T`.
     ``kernel_spec``:
         Optional :class:`gratopy.operator.opencl.OpenCLKernelSpec` describing
         which OpenCL kernel bundle to use. When omitted, the operator uses the
@@ -107,8 +105,10 @@ class Radon(_OpenCLOperator):
     **Notes**
 
     The operator accepts both :class:`pyopencl.array.Array` inputs and NumPy
-    arrays. When applying the operator to a NumPy array, a queue must be
-    available so that the data can be transferred to the device.
+    arrays. Every application to a NumPy array must receive an explicit queue
+    or a device output from which the queue can be inferred. Operators do not
+    remember queues from earlier applications. Device inputs carry their queue
+    and can therefore be used with the shorter ``R * image`` syntax.
 
     The operator supports 2D as well as slicewise 3D data. For example,
     a forward operator with image shape ``(Nx, Ny)`` maps:
@@ -147,12 +147,14 @@ class Radon(_OpenCLOperator):
     >>> gram_img = G.apply_to(img, queue=queue)
     """
 
+    _operator_name = "Radon"
+    _kernel_base_name = "radon"
+
     def __init__(
         self,
         image_domain: int | tuple[int, int] | ImageDomain,
         angles: Angles | int,
         detectors: Detectors | int | None = None,
-        adjoint: bool = False,
         kernel_spec: OpenCLKernelSpec | None = None,
     ):
         if not isinstance(image_domain, ImageDomain):
@@ -173,33 +175,33 @@ class Radon(_OpenCLOperator):
             "image_domain": image_domain,
             "angles": angles,
             "detectors": detectors,
-            "adjoint": adjoint,
         }
-        super().__init__(name="Radon", state=state, kernel_spec=kernel_spec)
+        super().__init__(
+            name=self._operator_name,
+            state=state,
+            kernel_spec=kernel_spec,
+        )
 
-        self.substitute_placeholder()
-        self.projection_settings: SimpleNamespace | None = None
+        self._resolve_extent_placeholders()
         self._host_struct: dict[str, Any] | None = None
         self._device_struct: dict[tuple[cl.Context, np.dtype], dict[str, Any]] = {}
 
         image_shape = self.image_domain.size
         sinogram_shape = (self.detectors.number, len(self.angles))
 
-        if self.adjoint:
-            self.input_shape = sinogram_shape
-            self.output_shape = image_shape
-        else:
-            self.input_shape = image_shape
-            self.output_shape = sinogram_shape
+        self.input_shape = image_shape
+        self.output_shape = sinogram_shape
 
     def _default_kernel_spec(self) -> OpenCLKernelSpec:
         kernel_path = Path(__file__).resolve().parent.parent / "radon.cl"
-        return OpenCLKernelSpec.from_path(kernel_path, base_name="radon")
+        return OpenCLKernelSpec.from_path(
+            kernel_path,
+            base_name=self._kernel_base_name,
+        )
 
     def __getstate__(self) -> dict[str, Any]:
         """Return pickle/deepcopy state without live OpenCL runtime objects."""
         state = super().__getstate__()
-        state["projection_settings"] = None
         state["_host_struct"] = None
         state["_device_struct"] = {}
         return state
@@ -215,24 +217,6 @@ class Radon(_OpenCLOperator):
     @property
     def detectors(self) -> Detectors:
         return self.state["detectors"]
-
-    @property
-    def adjoint(self) -> bool:
-        return self.state["adjoint"]
-
-    @property
-    def T(self) -> "Radon":
-        operator_copy = copy(self)
-        operator_copy.state = copy(self.state)
-        operator_copy.state["adjoint"] = not self.state["adjoint"]
-        operator_copy.input_shape, operator_copy.output_shape = (
-            operator_copy.output_shape,
-            operator_copy.input_shape,
-        )
-        return operator_copy
-
-    def _repr_name_(self) -> str:
-        return "Radon.T" if self.adjoint else "Radon"
 
     def _use_full_circle(self) -> bool:
         """Decide whether extent placeholders use full-circle geometry.
@@ -264,10 +248,103 @@ class Radon(_OpenCLOperator):
             )
         return True
 
-    def substitute_placeholder(self) -> None:
-        """Resolve extent placeholders to concrete numeric values."""
-        if isinstance(self.image_domain.extent, ExtentPlaceholder) and isinstance(
-            self.detectors.extent, ExtentPlaceholder
+    def _resolved_image_extent(
+        self,
+        placeholder: ExtentPlaceholder,
+        detector_extent: float,
+    ) -> float:
+        """Compute a numeric image extent from a fixed detector extent."""
+        Mx, My = self.image_domain.center
+        Md = self.detectors.center
+        Nx, Ny = self.image_domain.size
+        c = Nx / Ny
+        M = (Md, Mx, My)
+        full_circle = self._use_full_circle()
+
+        if placeholder == ExtentPlaceholder.FULL:
+            if full_circle:
+                result = full_image_given_detector_fullcircle(M, detector_extent, c)
+            else:
+                result = full_image_given_detector_halfcircle(M, detector_extent, c)
+        elif full_circle:
+            result = valid_image_given_detector_fullcircle(M, detector_extent, c)
+        else:
+            result = valid_image_given_detector_halfcircle(M, detector_extent, c)
+
+        if result is None:
+            if placeholder == ExtentPlaceholder.FULL:
+                meaning = (
+                    "FULL means the largest image extent such that every "
+                    "ray through the image also hits the detector"
+                )
+            else:
+                meaning = (
+                    "VALID means the smallest image extent such that every "
+                    "ray hitting the detector also passes through the image"
+                )
+            raise ValueError(
+                f"Cannot resolve ExtentPlaceholder.{placeholder.name} for the "
+                f"image domain ({meaning}): no such image extent exists with "
+                f"the given detector width Dd={detector_extent}, detector center "
+                f"Md={Md}, and image center ({Mx}, {My}). Consider increasing "
+                f"the detector width or adjusting the center offsets."
+            )
+
+        Dx, Dy = result
+        return max(Dx, Dy)
+
+    def _resolved_detector_extent(
+        self,
+        placeholder: ExtentPlaceholder,
+        image_extent: float,
+    ) -> float:
+        """Compute a numeric detector extent from a fixed image extent."""
+        Mx, My = self.image_domain.center
+        Md = self.detectors.center
+        Nx, Ny = self.image_domain.size
+        Dx = image_extent * Nx / max(Nx, Ny)
+        Dy = image_extent * Ny / max(Nx, Ny)
+        M = (Md, Mx, My)
+        D = (Dx, Dy)
+        full_circle = self._use_full_circle()
+        result: float | None
+
+        if placeholder == ExtentPlaceholder.FULL:
+            if full_circle:
+                result = full_detector_given_image_fullcircle(M, D)
+            else:
+                result = full_detector_given_image_halfcircle(M, D)
+        elif full_circle:
+            result = valid_detector_given_image_fullcircle(M, D)
+        else:
+            result = valid_detector_given_image_halfcircle(M, D)
+
+        if result is None:
+            if placeholder == ExtentPlaceholder.FULL:
+                meaning = (
+                    "FULL means the smallest detector width such that every "
+                    "ray through the image also hits the detector"
+                )
+            else:
+                meaning = (
+                    "VALID means the largest detector width such that every "
+                    "ray hitting the detector also passes through the image"
+                )
+            raise ValueError(
+                f"Cannot resolve ExtentPlaceholder.{placeholder.name} for the "
+                f"detector ({meaning}): no such detector width exists with image "
+                f"dimensions ({Dx}, {Dy}), detector center Md={Md}, and image "
+                f"center ({Mx}, {My}). Consider increasing the image extent or "
+                f"adjusting the center offsets."
+            )
+        return result
+
+    def _resolve_extent_placeholders(self) -> None:
+        """Resolve extent placeholders without mutating the input geometry."""
+        image_extent = self.image_domain.extent
+        detector_extent = self.detectors.extent
+        if isinstance(image_extent, ExtentPlaceholder) and isinstance(
+            detector_extent, ExtentPlaceholder
         ):
             raise NotImplementedError(
                 "Both the ImageDomain and Detectors use an ExtentPlaceholder. "
@@ -276,92 +353,25 @@ class Radon(_OpenCLOperator):
                 "automatically."
             )
 
-        if isinstance(self.image_domain.extent, ExtentPlaceholder):
-            Mx, My = self.image_domain.center
-            Md = self.detectors.center
-            Nx, Ny = self.image_domain.size
-            c = Nx / Ny
-            Dd = float(self.detectors.extent)
-            M = (Md, Mx, My)
-            full_circle = self._use_full_circle()
+        if isinstance(image_extent, ExtentPlaceholder):
+            assert not isinstance(detector_extent, ExtentPlaceholder)
+            self.state["image_domain"] = replace(
+                self.image_domain,
+                extent=self._resolved_image_extent(
+                    image_extent,
+                    float(detector_extent),
+                ),
+            )
 
-            if self.image_domain.extent == ExtentPlaceholder.FULL:
-                if full_circle:
-                    result = full_image_given_detector_fullcircle(M, Dd, c)
-                else:
-                    result = full_image_given_detector_halfcircle(M, Dd, c)
-            else:
-                if full_circle:
-                    result = valid_image_given_detector_fullcircle(M, Dd, c)
-                else:
-                    result = valid_image_given_detector_halfcircle(M, Dd, c)
-
-            if result is None:
-                if self.image_domain.extent == ExtentPlaceholder.FULL:
-                    meaning = (
-                        "FULL means the largest image extent such that every "
-                        "ray through the image also hits the detector"
-                    )
-                else:
-                    meaning = (
-                        "VALID means the smallest image extent such that "
-                        "every ray hitting the detector also passes through "
-                        "the image"
-                    )
-                raise ValueError(
-                    f"Cannot resolve ExtentPlaceholder.{self.image_domain.extent.name} "
-                    f"for the image domain ({meaning}): no such image extent "
-                    f"exists with the given detector width Dd={Dd}, detector "
-                    f"center Md={Md}, and image center ({Mx}, {My}). "
-                    f"Consider increasing the detector width or adjusting the "
-                    f"center offsets."
-                )
-            Dx, Dy = result
-            self.image_domain.extent = max(Dx, Dy)
-
-        if isinstance(self.detectors.extent, ExtentPlaceholder):
-            Mx, My = self.image_domain.center
-            Md = self.detectors.center
-            Nx, Ny = self.image_domain.size
-            extent = float(self.image_domain.extent)
-            Dx = extent * Nx / max(Nx, Ny)
-            Dy = extent * Ny / max(Nx, Ny)
-            M = (Md, Mx, My)
-            D = (Dx, Dy)
-            full_circle = self._use_full_circle()
-
-            if self.detectors.extent == ExtentPlaceholder.FULL:
-                if full_circle:
-                    result = full_detector_given_image_fullcircle(M, D)
-                else:
-                    result = full_detector_given_image_halfcircle(M, D)
-            else:
-                if full_circle:
-                    result = valid_detector_given_image_fullcircle(M, D)
-                else:
-                    result = valid_detector_given_image_halfcircle(M, D)
-
-            if result is None:
-                if self.detectors.extent == ExtentPlaceholder.FULL:
-                    meaning = (
-                        "FULL means the smallest detector width such that "
-                        "every ray through the image also hits the detector"
-                    )
-                else:
-                    meaning = (
-                        "VALID means the largest detector width such that "
-                        "every ray hitting the detector also passes through "
-                        "the image"
-                    )
-                raise ValueError(
-                    f"Cannot resolve ExtentPlaceholder.{self.detectors.extent.name} "
-                    f"for the detector ({meaning}): no such detector width "
-                    f"exists with image dimensions ({Dx}, {Dy}), detector "
-                    f"center Md={Md}, and image center ({Mx}, {My}). "
-                    f"Consider increasing the image extent or adjusting the "
-                    f"center offsets."
-                )
-            self.detectors.extent = result
+        if isinstance(detector_extent, ExtentPlaceholder):
+            assert not isinstance(image_extent, ExtentPlaceholder)
+            self.state["detectors"] = replace(
+                self.detectors,
+                extent=self._resolved_detector_extent(
+                    detector_extent,
+                    float(image_extent),
+                ),
+            )
 
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         if self._host_struct is not None:
@@ -393,24 +403,16 @@ class Radon(_OpenCLOperator):
         assert self._host_struct is not None
         ofs = self._host_struct["ofs_dict"][dtype]
         geometry = self._host_struct["geo_dict"][dtype]
-        angle_weights = self._host_struct["angle_diff_dict"][dtype]
 
         ofs_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, ofs.nbytes)
         geometry_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, geometry.nbytes)
-        angle_weights_buf = cl.Buffer(
-            queue.context,
-            cl.mem_flags.READ_ONLY,
-            angle_weights.nbytes,
-        )
 
         cl.enqueue_copy(queue, ofs_buf, ofs.data).wait()
         cl.enqueue_copy(queue, geometry_buf, geometry.data).wait()
-        cl.enqueue_copy(queue, angle_weights_buf, angle_weights.data).wait()
 
         device_struct = {
             "ofs": ofs_buf,
             "geometry": geometry_buf,
-            "angle_weights": angle_weights_buf,
         }
         self._device_struct[cache_key] = device_struct
         return device_struct
@@ -424,35 +426,29 @@ class Radon(_OpenCLOperator):
         device_struct = self._ensure_device_struct(queue, argument.dtype)
         return device_struct["ofs"], device_struct["geometry"]
 
-    def apply_to(
-        self,
-        argument: Any,
-        output: Any | None = None,
-        queue: cl.CommandQueue | None = None,
-        return_event: bool = False,
-        **kwargs: Any,
-    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
-        queue = self._infer_queue(argument=argument, output=output, queue=queue)
-        self.projection_settings = SimpleNamespace(queue=queue)
-        return super().apply_to(
-            argument,
-            output=output,
-            queue=queue,
-            return_event=return_event,
-        )
-
-
-"""Fanbeam-beam Radon transform operator.
-    -without the substitute placeholder-"""
 
 class Fanbeam(_OpenCLOperator):
+    """Fan-beam projection operator.
+
+    ``source_distances`` is either the source-to-detector distance or a
+    ``(source_detector_distance, source_origin_distance)`` tuple. For a scalar,
+    the source-to-origin distance defaults to half the supplied distance.
+
+    Integer angle counts generate a full-circle uniform sampling. As with
+    :class:`Radon`, the concrete operator represents the forward transform and
+    :attr:`T` returns an adjoint expression sharing this operator's runtime
+    caches.
+    """
+
+    _operator_name = "Fanbeam"
+    _kernel_base_name = "fanbeam"
+
     def __init__(
         self,
         source_distances: float | tuple[float, float],
         image_domain: int | tuple[int, int] | ImageDomain,
         angles: Angles | int,
         detectors: Detectors | int | None = None,
-        adjoint: bool = False,
         kernel_spec: OpenCLKernelSpec | None = None,
     ):
         if not isinstance(image_domain, ImageDomain):
@@ -468,12 +464,20 @@ class Fanbeam(_OpenCLOperator):
             if isinstance(detector_extent, ExtentPlaceholder):
                 detector_extent = ExtentPlaceholder.FULL
             detectors = Detectors(number=detectors, extent=detector_extent)
-    
+
         if isinstance(source_distances, tuple):
             source_detector_distance, source_origin_distance = source_distances
         else:
             source_detector_distance = source_distances
             source_origin_distance = source_distances / 2
+        source_detector_distance = float(source_detector_distance)
+        source_origin_distance = float(source_origin_distance)
+        if source_origin_distance <= 0:
+            raise ValueError("source_origin_distance must be positive")
+        if source_detector_distance <= source_origin_distance:
+            raise ValueError(
+                "source_detector_distance must be greater than source_origin_distance"
+            )
 
         state = {
             "source_detector_distance": source_detector_distance,
@@ -481,33 +485,29 @@ class Fanbeam(_OpenCLOperator):
             "image_domain": image_domain,
             "angles": angles,
             "detectors": detectors,
-            "adjoint": adjoint,
         }
-        super().__init__(name="Fanbeam", state=state, kernel_spec=kernel_spec)
+        super().__init__(
+            name=self._operator_name,
+            state=state,
+            kernel_spec=kernel_spec,
+        )
 
-        self.substitute_placeholder()
-        self.projection_settings: SimpleNamespace | None = None
+        self._validate_numeric_extents()
         self._host_struct: dict[str, Any] | None = None
         self._device_struct: dict[tuple[cl.Context, np.dtype], dict[str, Any]] = {}
-
-        image_shape = self.image_domain.size
-        sinogram_shape = (self.detectors.number, len(self.angles))
-
-        if self.adjoint:
-            self.input_shape = sinogram_shape
-            self.output_shape = image_shape
-        else:
-            self.input_shape = image_shape
-            self.output_shape = sinogram_shape
+        self.input_shape = self.image_domain.size
+        self.output_shape = (self.detectors.number, len(self.angles))
 
     def _default_kernel_spec(self) -> OpenCLKernelSpec:
         kernel_path = Path(__file__).resolve().parent.parent / "fanbeam.cl"
-        return OpenCLKernelSpec.from_path(kernel_path, base_name="fanbeam")
-    
+        return OpenCLKernelSpec.from_path(
+            kernel_path,
+            base_name=self._kernel_base_name,
+        )
+
     def __getstate__(self) -> dict[str, Any]:
         """Return pickle/deepcopy state without live OpenCL runtime objects."""
         state = super().__getstate__()
-        state["projection_settings"] = None
         state["_host_struct"] = None
         state["_device_struct"] = {}
         return state
@@ -532,48 +532,35 @@ class Fanbeam(_OpenCLOperator):
     def detectors(self) -> Detectors:
         return self.state["detectors"]
 
-    @property
-    def adjoint(self) -> bool:
-        return self.state["adjoint"]
-
-    @property
-    def T(self) -> "Fanbeam":
-        operator_copy = copy(self)
-        operator_copy.state = copy(self.state)
-        operator_copy.state["adjoint"] = not self.state["adjoint"]
-        operator_copy.input_shape, operator_copy.output_shape = (
-            operator_copy.output_shape,
-            operator_copy.input_shape,
-        )
-        return operator_copy
-
-    def _repr_name_(self) -> str:
-        return "Fanbeam.T" if self.adjoint else "Fanbeam"
-
-    def substitute_placeholder(self) -> None:
-        """(NOT IMPLEMENTED)"""
+    def _validate_numeric_extents(self) -> None:
+        """Reject fan-beam extent placeholders until their geometry is defined."""
         if isinstance(self.image_domain.extent, ExtentPlaceholder) or isinstance(
             self.detectors.extent, ExtentPlaceholder
         ):
             raise NotImplementedError(
-                " not implemented"
+                "Fanbeam extent placeholders are not implemented; provide "
+                "numeric image and detector extents."
             )
 
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         if self._host_struct is not None:
             return
 
+        detector_extent = self.detectors.extent
+        image_extent = self.image_domain.extent
+        assert not isinstance(detector_extent, ExtentPlaceholder)
+        assert not isinstance(image_extent, ExtentPlaceholder)
         self._host_struct = fanbeam_struct(
             queue=queue,
             img_shape=self.image_domain.size,
             angles=self.angles.angles,
-            detector_width=float(self.detectors.extent),
+            detector_width=float(detector_extent),
             source_detector_dist=float(self.source_detector_distance),
             source_origin_dist=float(self.source_origin_distance),
             angle_weights=self.angles.weights,
             n_detectors=self.detectors.number,
             detector_shift=self.detectors.center,
-            image_width=float(self.image_domain.extent),
+            image_width=float(image_extent),
             midpoint_shift=self.image_domain.center,
             reverse_detector=self.detectors.reversed,
         )
@@ -593,27 +580,19 @@ class Fanbeam(_OpenCLOperator):
         ofs = self._host_struct["ofs_dict"][dtype]
         sdpd = self._host_struct["sdpd_dict"][dtype]
         geometry = self._host_struct["geo_dict"][dtype]
-        angle_weights = self._host_struct["angle_diff_dict"][dtype]
 
         ofs_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, ofs.nbytes)
         sdpd_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, sdpd.nbytes)
         geometry_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, geometry.nbytes)
-        angle_weights_buf = cl.Buffer(
-            queue.context,
-            cl.mem_flags.READ_ONLY,
-            angle_weights.nbytes,
-        )
 
         cl.enqueue_copy(queue, ofs_buf, ofs.data).wait()
         cl.enqueue_copy(queue, sdpd_buf, sdpd.data).wait()
         cl.enqueue_copy(queue, geometry_buf, geometry.data).wait()
-        cl.enqueue_copy(queue, angle_weights_buf, angle_weights.data).wait()
 
         device_struct = {
             "ofs": ofs_buf,
             "sdpd": sdpd_buf,
             "geometry": geometry_buf,
-            "angle_weights": angle_weights_buf,
         }
         self._device_struct[cache_key] = device_struct
         return device_struct
@@ -627,102 +606,23 @@ class Fanbeam(_OpenCLOperator):
         device_struct = self._ensure_device_struct(queue, argument.dtype)
         return device_struct["ofs"], device_struct["sdpd"], device_struct["geometry"]
 
-    def apply_to(
-        self,
-        argument: npt.ArrayLike | clarray.Array,
-        output: clarray.Array | None = None,
-        queue: cl.CommandQueue | None = None,
-        return_event: bool = False,
-    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
-        queue = self._infer_queue(argument=argument, output=output, queue=queue)
-        self.projection_settings = SimpleNamespace(queue=queue)
-        return super().apply_to(
-            argument,
-            output=output,
-            queue=queue,
-            return_event=return_event,
-        )
-
-
-"""Derived operators: ray-driven Radon and Fanbeam and strip Radon"""
 
 class RayDrivenRadon(Radon):
-    """Ray-driven Radon transform operator."""
+    """Ray-driven parallel-beam projection operator."""
 
-    def __init__(
-        self,
-        image_domain: int | tuple[int, int] | ImageDomain,
-        angles: Angles | int,
-        detectors: Detectors | int | None = None,
-        adjoint: bool = False,
-        kernel_spec: OpenCLKernelSpec | None = None,
-    ):
-        super().__init__(
-            image_domain=image_domain,
-            angles=angles,
-            detectors=detectors,
-            adjoint=adjoint,
-            kernel_spec=kernel_spec,
-        )
-        self.name = "RayDrivenRadon"
-
-    def _default_kernel_spec(self) -> OpenCLKernelSpec:
-        kernel_path = Path(__file__).resolve().parent.parent / "radon.cl"
-        return OpenCLKernelSpec.from_path(kernel_path, base_name="radon_ray")
-
-
-class RayDrivenFanbeam(Fanbeam):
-    """Ray-driven fanbeam transform operator."""
-
-    def __init__(
-        self,
-        source_distances: float | tuple[float, float],
-        image_domain: int | tuple[int, int] | ImageDomain,
-        angles: Angles | int,
-        detectors: Detectors | int | None = None,
-        adjoint: bool = False,
-        kernel_spec: OpenCLKernelSpec | None = None,
-    ):
-        super().__init__(
-            source_distances=source_distances,
-            image_domain=image_domain,
-            angles=angles,
-            detectors=detectors,
-            adjoint=adjoint,
-            kernel_spec=kernel_spec,
-        )
-        self.name = "RayDrivenFanbeam"
-
-    def _default_kernel_spec(self) -> OpenCLKernelSpec:
-        kernel_path = Path(__file__).resolve().parent.parent / "fanbeam.cl"
-        return OpenCLKernelSpec.from_path(kernel_path, base_name="fanbeam_ray")
+    _operator_name = "RayDrivenRadon"
+    _kernel_base_name = "radon_ray"
 
 
 class StripDrivenRadon(Radon):
-    """Strip-driven parallel-beam Radon transform operator."""
+    """Strip-driven parallel-beam projection operator."""
 
-    def __init__(
-        self,
-        image_domain: int | tuple[int, int] | ImageDomain,
-        angles: Angles | int,
-        detectors: Detectors | int | None = None,
-        adjoint: bool = False,
-        kernel_spec: OpenCLKernelSpec | None = None,
-    ):
-        super().__init__(
-            image_domain=image_domain,
-            angles=angles,
-            detectors=detectors,
-            adjoint=adjoint,
-            kernel_spec=kernel_spec,
-        )
-        self.name = "StripDrivenRadon"
-
-    def _default_kernel_spec(self) -> OpenCLKernelSpec:
-        kernel_path = Path(__file__).resolve().parent.parent / "radon.cl"
-        return OpenCLKernelSpec.from_path(kernel_path, base_name="radon_strip")
+    _operator_name = "StripDrivenRadon"
+    _kernel_base_name = "radon_strip"
 
 
-# R, R_E parameters for fanbeam tranform: pass as _one_ argument, tuple
-# or new dataclass. source_detector_distance, source_origin_distance
-# if only one value is given, it is R, and R_E is R/2.
+class RayDrivenFanbeam(Fanbeam):
+    """Ray-driven fan-beam projection operator."""
+
+    _operator_name = "RayDrivenFanbeam"
+    _kernel_base_name = "fanbeam_ray"
