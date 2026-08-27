@@ -60,7 +60,6 @@ The full list of requirements can be found in [`pyproject.toml`](/pyproject.toml
 We refer to the extensive [documentation](https://gratopy.readthedocs.io/), in particular to the [getting started](https://gratopy.readthedocs.io/en/latest/getting_started.html) guide, the new [operator syntax](https://gratopy.readthedocs.io/en/latest/operator_api.html) page, as well as to the test files for the [Radon transform](https://gratopy.readthedocs.io/en/latest/_modules/test_radon.html) and [fanbeam transform](https://gratopy.readthedocs.io/en/latest/_modules/test_fanbeam.html). The following [rudimentary example](https://gratopy.readthedocs.io/en/latest/getting_started.html#first-example-radon-transform) is also included in the documentation.
 
 ```python
-
 # initial import
 import numpy as np
 import pyopencl as cl
@@ -80,11 +79,12 @@ ctx = cl.create_some_context()
 queue = cl.CommandQueue(ctx)
 
 # create phantom as test image (a pyopencl.array.Array of dimensions (Nx, Nx))
-phantom = gratopy.phantom(queue,Nx)
+phantom = gratopy.phantom(queue, Nx)
 
 # create suitable projectionsettings
-PS = gratopy.ProjectionSettings(queue, gratopy.RADON, phantom.shape,
-                                number_angles, number_detectors)
+PS = gratopy.ProjectionSettings(
+    queue, gratopy.RADON, phantom.shape, number_angles, number_detectors
+)
 
 # compute forward projection and backprojection of created sinogram
 # results are pyopencl arrays

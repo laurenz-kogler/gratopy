@@ -451,9 +451,7 @@ def _image_placeholder_cases_halfcircle():
     """Yield (placeholder, side_ratio, detector_center, image_center, expected)."""
     for placeholder in [ExtentPlaceholder.VALID, ExtentPlaceholder.FULL]:
         for sr in SIDE_RATIOS:
-            expected_list = list(
-                IMAGE_PLACEHOLDER_EXPECTED_HALFCIRCLE[(placeholder, sr)]
-            )
+            expected_list = list(IMAGE_PLACEHOLDER_EXPECTED_HALFCIRCLE[(placeholder, sr)])
             idx = 0
             for dc in DETECTOR_CENTERS:
                 for ic in IMAGE_CENTERS:
@@ -914,9 +912,7 @@ def _image_placeholder_cases_fullcircle():
     """Yield (placeholder, side_ratio, detector_center, image_center, expected)."""
     for placeholder in [ExtentPlaceholder.VALID, ExtentPlaceholder.FULL]:
         for sr in SIDE_RATIOS:
-            expected_list = list(
-                IMAGE_PLACEHOLDER_EXPECTED_FULLCIRCLE[(placeholder, sr)]
-            )
+            expected_list = list(IMAGE_PLACEHOLDER_EXPECTED_FULLCIRCLE[(placeholder, sr)])
             idx = 0
             for dc in DETECTOR_CENTERS:
                 for ic in IMAGE_CENTERS:
