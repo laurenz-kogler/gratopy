@@ -32,8 +32,10 @@ The current operator API supports in particular:
 - operator composition and arithmetic,
 - custom OpenCL kernels via :class:`gratopy.operator.opencl.OpenCLKernelSpec`.
 
-At the moment, the operator API should be understood as **Radon-first**.
-Fanbeam support is not yet implemented at the same level.
+At the moment, the operator API should be understood as **Radon-only** for
+execution. The exported ``Fanbeam`` class is currently a non-executable
+placeholder for the future operator port; use the legacy API for fanbeam
+projections.
 
 Quick example
 -------------
@@ -44,6 +46,7 @@ A Radon transform and its adjoint can be used as follows:
 
     import numpy as np
     import pyopencl as cl
+    import pyopencl.array as clarray
     import gratopy
 
     ctx = cl.create_some_context(interactive=False)
@@ -57,15 +60,43 @@ A Radon transform and its adjoint can be used as follows:
     sino = R.apply_to(img, queue=queue)
     backprojection = R.T.apply_to(sino)
 
-The same operations can be written with operator syntax:
+The same operations can be written with operator syntax when the arrays
+already reside on the OpenCL device:
 
 .. code-block:: python
 
-    sino = R * img
+    device_img = clarray.to_device(queue, img)
+    sino = R * device_img
     backprojection = R.T * sino
 
-When the input is a NumPy array, a queue is still required for the first
-application so that the data can be transferred to the device.
+Queue selection is deterministic and does not depend on earlier applications.
+An explicit ``queue=`` takes precedence; otherwise the queue is inferred from
+a device argument or device output. Consequently, every application to a
+NumPy array must either receive ``queue=`` explicitly or receive a
+caller-provided :class:`pyopencl.array.Array` output. The multiplication
+shorthand has no place to pass a queue and is therefore intended for device
+arrays.
+
+Output reuse and events
+-----------------------
+
+Applications allocate a result when ``output`` is omitted. Allocation-sensitive
+iterative code can provide a compatible device output instead:
+
+.. code-block:: python
+
+    output = clarray.empty(queue, R.output_shape, dtype=np.float32)
+    R.apply_to(device_img, output=output)
+
+Compositions forward ``output`` to their final operation, while sums write
+their first summand directly into it before accumulating the remaining terms.
+Composite intermediates may still be allocated internally. Reusing outputs is
+recommended in long iterative loops; retaining every newly returned output
+necessarily retains the corresponding device memory.
+
+OpenCL execution is asynchronous. Passing ``return_event=True`` returns
+``(result, events)`` with the result's current event list in addition to
+recording those events on the result array.
 
 Detailed geometry example
 -------------------------
@@ -169,6 +200,15 @@ both the image and detector extents is unsupported and raises
 geometrically impossible for the supplied centers and fixed extent, construction
 raises :class:`ValueError`.
 
+Adjoint convention
+------------------
+
+The Radon adjoint uses the same weighted discretization as the legacy API.
+Angular quadrature weights from :class:`gratopy.utilities.Angles` are included
+in the backprojection kernel. Thus ``R.T`` denotes the adjoint with respect to
+gratopy's physical image and sinogram pairings; it is not generally the plain
+Euclidean transpose of the unweighted forward-projection matrix.
+
 Operator algebra
 ----------------
 
@@ -190,7 +230,32 @@ and apply it to an image:
 
 This is one of the main motivations for the operator interface: projection
 operators can be combined with a syntax that mirrors the underlying linear
-algebra.
+algebra. The multiplication syntax is intentionally overloaded:
+
+- ``A * B`` composes two operators,
+- ``alpha * A`` and ``A * alpha`` scale an operator,
+- ``A * x`` applies an operator to a non-operator argument.
+
+Addition and subtraction construct sum expressions. Algebra creates dedicated
+expression nodes and never mutates or copies concrete leaves.
+
+Norm estimation
+---------------
+
+Every operator provides :meth:`gratopy.operator.base.Operator.norm_estimate`.
+The default ``"poweriteration"`` algorithm applies power iteration to
+``A.T * A`` and supports OpenCL operators via an explicit queue:
+
+.. code-block:: python
+
+    estimate = R.norm_estimate(queue=queue, number_iterations=30)
+
+The alternative ``"naive"`` algorithm combines leaf values structurally using
+the triangle inequality for sums and submultiplicativity of operator norms for
+compositions. These inequalities preserve certified upper bounds, but unknown
+leaf norms are currently obtained from finite power iterations and are not
+themselves certified upper bounds. The resulting combined value is therefore a
+heuristic unless certified bounds are available for every leaf.
 
 Class structure
 ---------------
@@ -233,7 +298,9 @@ retain their concrete leaves and therefore participate in the same lifecycle.
 
 Kernel instances are local to each calling thread because OpenCL kernel
 arguments are mutable. Threads share the compiled program but not argument
-state.
+state. This protects kernel argument setup, but it does not yet constitute a
+guarantee that complete operators can be applied concurrently: other lazy
+runtime caches still require a dedicated thread-safety pass.
 
 The registry can be invalidated explicitly when required:
 
@@ -245,6 +312,9 @@ The registry can be invalidated explicitly when required:
 
 Live operators acquire newly compiled bundles on their next application.
 Invocations already in progress may finish with their existing program.
+Invalidation removes bundles from future lookup; an existing operator may keep
+its old lease alive until its next application or until the operator is
+released.
 
 Custom kernels
 --------------
@@ -318,7 +388,8 @@ Limitations and status
 
 The operator API is still evolving. In particular:
 
-- the focus is currently on :class:`gratopy.operator.projection.Radon`,
+- only :class:`gratopy.operator.projection.Radon` currently has an executable
+  operator implementation; ``Fanbeam`` remains a placeholder,
 - extent placeholders are currently supported experimentally for Radon
   operators when exactly one of the image or detector extents is a placeholder,
 - higher-level solver interfaces are still centered around the legacy API.

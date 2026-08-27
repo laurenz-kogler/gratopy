@@ -107,7 +107,7 @@ plt.show()
 ```
 
 ### Experimental operator syntax
-Gratopy also provides an **experimental** operator-based API for Radon transforms via `gratopy.operator.Radon`. This interface supports operator algebra such as adjoints and compositions, for example `R.T * R`, and can also be paired with custom OpenCL kernels for experimentation. As this interface is still experimental, backward-incompatible changes may still occur without a full deprecation cycle.
+Gratopy also provides an **experimental**, currently Radon-only operator API via `gratopy.operator.Radon`. This interface supports operator algebra such as adjoints and compositions, for example `R.T * R`, and can also be paired with custom OpenCL kernels for experimentation. NumPy inputs require an explicit OpenCL queue on every application; device-array inputs carry their queue and support the shorter `R * image` syntax. Fanbeam execution remains available through the legacy API. As this interface is still experimental, backward-incompatible changes may still occur without a full deprecation cycle.
 
 ```python
 import numpy as np

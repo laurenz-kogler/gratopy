@@ -475,23 +475,56 @@ def test_radon_numpy_coercion_clarray_input():
     assert sinogram.shape == (R.detectors.number, n_angles)
 
 
-def test_radon_numpy_coercion_reuses_last_queue():
-    """Test that Radon.apply_to() reuses its last explicit queue."""
+def test_radon_numpy_coercion_does_not_remember_an_explicit_queue():
+    """Test that host-array execution never depends on call history."""
     ctx = cl.create_some_context(interactive=False)
     queue = cl.CommandQueue(ctx)
+    R = Radon(image_domain=16, angles=10)
+    image = np.zeros(R.input_shape, dtype=np.float32)
 
-    Nx = 16
-    n_angles = 10
-    R = Radon(image_domain=Nx, angles=n_angles)
+    R.apply_to(image, queue=queue)
 
-    img_np = np.zeros((Nx, Nx), dtype=np.float32)
+    with pytest.raises(ValueError, match="No OpenCL queue available"):
+        R.apply_to(image)
 
-    # First call records the explicit queue.
-    R.apply_to(img_np, queue=queue)
 
-    # Second call without a queue reuses the recorded queue.
-    sinogram2 = R.apply_to(img_np)
-    assert isinstance(sinogram2, clarray.Array)
+def test_radon_explicit_queue_takes_precedence_over_argument_queue():
+    ctx = cl.create_some_context(interactive=False)
+    argument_queue = cl.CommandQueue(ctx)
+    explicit_queue = cl.CommandQueue(ctx)
+    R = Radon(image_domain=16, angles=10)
+    image = clarray.zeros(argument_queue, R.input_shape, dtype=np.float32)
+
+    result = R.apply_to(image, queue=explicit_queue)
+
+    assert result.queue == explicit_queue
+
+
+def test_radon_numpy_coercion_infers_queue_from_output():
+    """Test queue inference from a caller-provided device output."""
+    ctx = cl.create_some_context(interactive=False)
+    queue = cl.CommandQueue(ctx)
+    R = Radon(image_domain=16, angles=10)
+    image = np.zeros(R.input_shape, dtype=np.float32)
+    output = clarray.empty(queue, R.output_shape, dtype=np.float32)
+
+    result = R.apply_to(image, output=output)
+
+    assert result.data == output.data
+
+
+def test_radon_operator_syntax_infers_queue_from_device_argument():
+    ctx = cl.create_some_context(interactive=False)
+    queue = cl.CommandQueue(ctx)
+    R = Radon(image_domain=16, angles=10)
+    image = clarray.zeros(queue, R.input_shape, dtype=np.float32)
+
+    sinogram = R * image
+    backprojection = R.T * sinogram
+
+    assert isinstance(sinogram, clarray.Array)
+    assert isinstance(backprojection, clarray.Array)
+    assert backprojection.shape == R.input_shape
 
 
 def test_radon_numpy_coercion_no_queue_error():

@@ -261,7 +261,6 @@ class _OpenCLOperator(Operator):
     ):
         super().__init__(name=name, **operator_kwargs)
         self.kernel_spec = kernel_spec or self._default_kernel_spec()
-        self._last_queue: cl.CommandQueue | None = None
         self._program_bundles: dict[_ProgramLeaseKey, _ProgramBundle] = {}
 
     def _default_kernel_spec(self) -> OpenCLKernelSpec:
@@ -273,9 +272,8 @@ class _OpenCLOperator(Operator):
         raise NotImplementedError("Concrete OpenCL operators must define a kernel spec")
 
     def __getstate__(self) -> dict[str, Any]:
-        """Return pickle/deepcopy state without live OpenCL queue handles."""
+        """Return pickle/deepcopy state without live OpenCL program leases."""
         state = super().__getstate__()
-        state["_last_queue"] = None
         state["_program_bundles"] = {}
         return state
 
@@ -287,19 +285,13 @@ class _OpenCLOperator(Operator):
     ) -> cl.CommandQueue:
         """Infer the queue to use for computation."""
         if queue is not None:
-            self._last_queue = queue
             return queue
 
         if isinstance(argument, clarray.Array) and argument.queue is not None:
-            self._last_queue = argument.queue
             return argument.queue
 
         if isinstance(output, clarray.Array) and output.queue is not None:
-            self._last_queue = output.queue
             return output.queue
-
-        if self._last_queue is not None:
-            return self._last_queue
 
         raise ValueError(
             "No OpenCL queue available. Either pass an explicit queue, provide "

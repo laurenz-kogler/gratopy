@@ -12,6 +12,7 @@ Examples
 
 >>> import numpy as np
 >>> import pyopencl as cl
+>>> import pyopencl.array as clarray
 >>> import gratopy
 >>> ctx = cl.create_some_context(interactive=False)
 >>> queue = cl.CommandQueue(ctx)
@@ -22,9 +23,10 @@ Examples
 >>> backprojection = R.T.apply_to(sinogram)
 
 The same forward and adjoint applications can also be written via operator
-syntax:
+syntax when the arrays already reside on the OpenCL device:
 
->>> sinogram = R * img
+>>> device_img = clarray.to_device(queue, img)
+>>> sinogram = R * device_img
 >>> backprojection = R.T * sinogram
 """
 
@@ -105,8 +107,10 @@ class Radon(_OpenCLOperator):
     **Notes**
 
     The operator accepts both :class:`pyopencl.array.Array` inputs and NumPy
-    arrays. When applying the operator to a NumPy array, a queue must be
-    available so that the data can be transferred to the device.
+    arrays. Every application to a NumPy array must receive an explicit queue
+    or a device output from which the queue can be inferred. Operators do not
+    remember queues from earlier applications. Device inputs carry their queue
+    and can therefore be used with the shorter ``R * image`` syntax.
 
     The operator supports 2D as well as slicewise 3D data. For example,
     a forward operator with image shape ``(Nx, Ny)`` maps:
@@ -403,40 +407,15 @@ class Radon(_OpenCLOperator):
         device_struct = self._ensure_device_struct(queue, argument.dtype)
         return device_struct["ofs"], device_struct["geometry"]
 
-    def apply_to(
-        self,
-        argument: Any,
-        output: Any | None = None,
-        queue: cl.CommandQueue | None = None,
-        return_event: bool = False,
-        **kwargs: Any,
-    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
-        queue = self._infer_queue(argument=argument, output=output, queue=queue)
-        return super().apply_to(
-            argument,
-            output=output,
-            queue=queue,
-            return_event=return_event,
-        )
-
-    def apply_adjoint_to(
-        self,
-        argument: Any,
-        output: Any | None = None,
-        queue: cl.CommandQueue | None = None,
-        return_event: bool = False,
-        **kwargs: Any,
-    ) -> clarray.Array | tuple[clarray.Array, list[cl.Event]]:
-        queue = self._infer_queue(argument=argument, output=output, queue=queue)
-        return super().apply_adjoint_to(
-            argument,
-            output=output,
-            queue=queue,
-            return_event=return_event,
-        )
-
 
 class Fanbeam(Operator):
+    """Placeholder for the future fanbeam operator implementation.
+
+    This class currently stores no executable fanbeam geometry and inherits the
+    base methods that raise :class:`NotImplementedError`. Use the legacy
+    :class:`gratopy.ProjectionSettings` fanbeam interface for computations.
+    """
+
     def __init__(
         self,
         source_distances: float | tuple[float, float],
