@@ -34,10 +34,11 @@ def make_parallel_operator(operator_class):
 
 def make_fanbeam_operator(operator_class):
     return operator_class(
-        source_distances=(8.0, 4.0),
         image_domain=ImageDomain(size=(24, 20), extent=2.0, center=(0.05, -0.03)),
         angles=Angles.uniform(24),
         detectors=Detectors(number=29, extent=3.0, center=0.1, reversed=True),
+        source_detector_distance=8.0,
+        source_origin_distance=4.0,
     )
 
 
@@ -191,25 +192,42 @@ def test_fanbeam_operator_variants_share_runtime_with_adjoint(operator_class, qu
     queue.finish()
 
     assert len(operator._device_struct) == 1
-    assert set(next(iter(operator._device_struct.values()))) == {
-        "ofs",
-        "sdpd",
-        "geometry",
-    }
+    expected_buffers = {"ofs", "geometry"}
+    if operator_class is Fanbeam:
+        expected_buffers.add("sdpd")
+    assert set(next(iter(operator._device_struct.values()))) == expected_buffers
 
 
-def test_fanbeam_scalar_source_distance_uses_half_distance_to_origin():
-    operator = Fanbeam(source_distances=8.0, image_domain=16, angles=20)
+def test_fanbeam_uses_explicit_source_distances():
+    operator = Fanbeam(
+        image_domain=16,
+        angles=20,
+        detectors=Detectors(number=24, extent=3.0),
+        source_detector_distance=8.0,
+        source_origin_distance=4.0,
+    )
 
     assert operator.source_detector_distance == 8.0
     assert operator.source_origin_distance == 4.0
     assert operator.angles.half_circle is False
 
 
-@pytest.mark.parametrize("source_distances", [(4.0, 4.0), (3.0, 4.0), -2.0])
-def test_fanbeam_rejects_invalid_source_distances(source_distances):
+@pytest.mark.parametrize(
+    ("source_detector_distance", "source_origin_distance"),
+    [(4.0, 4.0), (3.0, 4.0), (-2.0, -1.0), (np.inf, 4.0)],
+)
+def test_fanbeam_rejects_invalid_source_distances(
+    source_detector_distance,
+    source_origin_distance,
+):
     with pytest.raises(ValueError, match="source_.*distance"):
-        Fanbeam(source_distances=source_distances, image_domain=16, angles=20)
+        Fanbeam(
+            image_domain=16,
+            angles=20,
+            detectors=Detectors(number=24, extent=3.0),
+            source_detector_distance=source_detector_distance,
+            source_origin_distance=source_origin_distance,
+        )
 
 
 def test_fanbeam_rejects_extent_placeholders_without_mutating_geometry():
@@ -218,10 +236,11 @@ def test_fanbeam_rejects_extent_placeholders_without_mutating_geometry():
 
     with pytest.raises(NotImplementedError, match="numeric image and detector extents"):
         Fanbeam(
-            source_distances=8.0,
             image_domain=image_domain,
             angles=20,
             detectors=detectors,
+            source_detector_distance=8.0,
+            source_origin_distance=4.0,
         )
 
     assert image_domain.extent == 2.0

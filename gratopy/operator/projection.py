@@ -58,7 +58,94 @@ from gratopy.utilities import (
 )
 
 
-class Radon(_OpenCLOperator):
+class _ProjectionOperator(_OpenCLOperator):
+    """Shared runtime plumbing for concrete projection geometries."""
+
+    _operator_name = "Projection"
+    _kernel_filename = ""
+    _kernel_base_name = ""
+    _device_array_specs: tuple[tuple[str, str], ...] = ()
+
+    def __init__(
+        self,
+        *,
+        state: dict[str, Any],
+        kernel_spec: OpenCLKernelSpec | None,
+    ) -> None:
+        super().__init__(
+            name=self._operator_name,
+            state=state,
+            kernel_spec=kernel_spec,
+        )
+        self._host_struct: dict[str, Any] | None = None
+        self._device_struct: dict[tuple[cl.Context, np.dtype], dict[str, Any]] = {}
+        self.input_shape = self.image_domain.size
+        self.output_shape = (self.detectors.number, len(self.angles))
+
+    def _default_kernel_spec(self) -> OpenCLKernelSpec:
+        kernel_path = Path(__file__).resolve().parent.parent / self._kernel_filename
+        return OpenCLKernelSpec.from_path(
+            kernel_path,
+            base_name=self._kernel_base_name,
+        )
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Return pickle/deepcopy state without live OpenCL runtime objects."""
+        state = super().__getstate__()
+        state["_host_struct"] = None
+        state["_device_struct"] = {}
+        return state
+
+    @property
+    def image_domain(self) -> ImageDomain:
+        return self.state["image_domain"]
+
+    @property
+    def angles(self) -> Angles:
+        return self.state["angles"]
+
+    @property
+    def detectors(self) -> Detectors:
+        return self.state["detectors"]
+
+    def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
+        """Populate the geometry-specific host structure."""
+        raise NotImplementedError
+
+    def _ensure_device_struct(
+        self,
+        queue: cl.CommandQueue,
+        dtype: npt.DTypeLike,
+    ) -> dict[str, Any]:
+        self._ensure_host_struct(queue)
+        dtype = np.dtype(dtype)
+        cache_key = (queue.context, dtype)
+        if cache_key in self._device_struct:
+            return self._device_struct[cache_key]
+
+        assert self._host_struct is not None
+        host_arrays = {
+            device_name: self._host_struct[host_name][dtype]
+            for device_name, host_name in self._device_array_specs
+        }
+        device_struct = self._upload_read_only_buffers(queue, host_arrays)
+        self._device_struct[cache_key] = device_struct
+        return device_struct
+
+    def _kernel_arguments(
+        self,
+        output: clarray.Array,
+        argument: clarray.Array,
+        queue: cl.CommandQueue,
+    ) -> tuple[Any, ...]:
+        device_struct = self._ensure_device_struct(queue, argument.dtype)
+        return tuple(
+            device_struct[device_name]
+            for device_name, _host_name in self._device_array_specs
+        )
+
+
+class Radon(_ProjectionOperator):
     """Parallel-beam Radon transform operator.
 
     This class provides the main entry point to gratopy's experimental
@@ -148,7 +235,9 @@ class Radon(_OpenCLOperator):
     """
 
     _operator_name = "Radon"
+    _kernel_filename = "radon.cl"
     _kernel_base_name = "radon"
+    _device_array_specs = (("ofs", "ofs_dict"), ("geometry", "geo_dict"))
 
     def __init__(
         self,
@@ -176,47 +265,8 @@ class Radon(_OpenCLOperator):
             "angles": angles,
             "detectors": detectors,
         }
-        super().__init__(
-            name=self._operator_name,
-            state=state,
-            kernel_spec=kernel_spec,
-        )
-
+        super().__init__(state=state, kernel_spec=kernel_spec)
         self._resolve_extent_placeholders()
-        self._host_struct: dict[str, Any] | None = None
-        self._device_struct: dict[tuple[cl.Context, np.dtype], dict[str, Any]] = {}
-
-        image_shape = self.image_domain.size
-        sinogram_shape = (self.detectors.number, len(self.angles))
-
-        self.input_shape = image_shape
-        self.output_shape = sinogram_shape
-
-    def _default_kernel_spec(self) -> OpenCLKernelSpec:
-        kernel_path = Path(__file__).resolve().parent.parent / "radon.cl"
-        return OpenCLKernelSpec.from_path(
-            kernel_path,
-            base_name=self._kernel_base_name,
-        )
-
-    def __getstate__(self) -> dict[str, Any]:
-        """Return pickle/deepcopy state without live OpenCL runtime objects."""
-        state = super().__getstate__()
-        state["_host_struct"] = None
-        state["_device_struct"] = {}
-        return state
-
-    @property
-    def image_domain(self) -> ImageDomain:
-        return self.state["image_domain"]
-
-    @property
-    def angles(self) -> Angles:
-        return self.state["angles"]
-
-    @property
-    def detectors(self) -> Detectors:
-        return self.state["detectors"]
 
     def _use_full_circle(self) -> bool:
         """Decide whether extent placeholders use full-circle geometry.
@@ -389,68 +439,41 @@ class Radon(_OpenCLOperator):
             detector_shift=self.detectors.center,
         )
 
-    def _ensure_device_struct(
-        self,
-        queue: cl.CommandQueue,
-        dtype: npt.DTypeLike,
-    ) -> dict[str, Any]:
-        self._ensure_host_struct(queue)
-        dtype = np.dtype(dtype)
-        cache_key = (queue.context, dtype)
-        if cache_key in self._device_struct:
-            return self._device_struct[cache_key]
 
-        assert self._host_struct is not None
-        ofs = self._host_struct["ofs_dict"][dtype]
-        geometry = self._host_struct["geo_dict"][dtype]
-
-        ofs_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, ofs.nbytes)
-        geometry_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, geometry.nbytes)
-
-        cl.enqueue_copy(queue, ofs_buf, ofs.data).wait()
-        cl.enqueue_copy(queue, geometry_buf, geometry.data).wait()
-
-        device_struct = {
-            "ofs": ofs_buf,
-            "geometry": geometry_buf,
-        }
-        self._device_struct[cache_key] = device_struct
-        return device_struct
-
-    def _kernel_arguments(
-        self,
-        output: clarray.Array,
-        argument: clarray.Array,
-        queue: cl.CommandQueue,
-    ) -> tuple[Any, ...]:
-        device_struct = self._ensure_device_struct(queue, argument.dtype)
-        return device_struct["ofs"], device_struct["geometry"]
-
-
-class Fanbeam(_OpenCLOperator):
+class Fanbeam(_ProjectionOperator):
     """Fan-beam projection operator.
 
-    ``source_distances`` is either the source-to-detector distance or a
-    ``(source_detector_distance, source_origin_distance)`` tuple. For a scalar,
-    the source-to-origin distance defaults to half the supplied distance.
+    ``source_detector_distance`` is the orthogonal distance from source to
+    detector, corresponding to ``R`` in the legacy API.
+    ``source_origin_distance`` is the distance from source to rotation center,
+    corresponding to legacy ``RE``. Both are mandatory keyword-only arguments.
 
+    Fan-beam geometry requires an explicit :class:`Detectors` value because its
+    physical extent cannot be inferred independently of the source geometry.
     Integer angle counts generate a full-circle uniform sampling. As with
-    :class:`Radon`, the concrete operator represents the forward transform and
-    :attr:`T` returns an adjoint expression sharing this operator's runtime
-    caches.
+    :class:`Radon`, :attr:`T` returns an adjoint expression sharing this
+    concrete operator's runtime caches.
     """
 
     _operator_name = "Fanbeam"
+    _kernel_filename = "fanbeam.cl"
     _kernel_base_name = "fanbeam"
+    _device_array_specs: tuple[tuple[str, str], ...] = (
+        ("ofs", "ofs_dict"),
+        ("sdpd", "sdpd_dict"),
+        ("geometry", "geo_dict"),
+    )
 
     def __init__(
         self,
-        source_distances: float | tuple[float, float],
         image_domain: int | tuple[int, int] | ImageDomain,
         angles: Angles | int,
-        detectors: Detectors | int | None = None,
+        detectors: Detectors,
+        *,
+        source_detector_distance: float,
+        source_origin_distance: float,
         kernel_spec: OpenCLKernelSpec | None = None,
-    ):
+    ) -> None:
         if not isinstance(image_domain, ImageDomain):
             image_domain = ImageDomain(size=image_domain, extent=2.0)
 
@@ -458,59 +481,20 @@ class Fanbeam(_OpenCLOperator):
             angles = Angles.uniform(number=angles)
 
         if not isinstance(detectors, Detectors):
-            if detectors is None:
-                detectors = int(np.ceil(np.hypot(*image_domain.size)))
-            detector_extent = image_domain.extent
-            if isinstance(detector_extent, ExtentPlaceholder):
-                detector_extent = ExtentPlaceholder.FULL
-            detectors = Detectors(number=detectors, extent=detector_extent)
-
-        if isinstance(source_distances, tuple):
-            source_detector_distance, source_origin_distance = source_distances
-        else:
-            source_detector_distance = source_distances
-            source_origin_distance = source_distances / 2
-        source_detector_distance = float(source_detector_distance)
-        source_origin_distance = float(source_origin_distance)
-        if source_origin_distance <= 0:
-            raise ValueError("source_origin_distance must be positive")
-        if source_detector_distance <= source_origin_distance:
-            raise ValueError(
-                "source_detector_distance must be greater than source_origin_distance"
+            raise TypeError(
+                "Fanbeam detectors must be an explicit Detectors instance "
+                "with a numeric physical extent."
             )
 
         state = {
-            "source_detector_distance": source_detector_distance,
-            "source_origin_distance": source_origin_distance,
+            "source_detector_distance": float(source_detector_distance),
+            "source_origin_distance": float(source_origin_distance),
             "image_domain": image_domain,
             "angles": angles,
             "detectors": detectors,
         }
-        super().__init__(
-            name=self._operator_name,
-            state=state,
-            kernel_spec=kernel_spec,
-        )
-
-        self._validate_numeric_extents()
-        self._host_struct: dict[str, Any] | None = None
-        self._device_struct: dict[tuple[cl.Context, np.dtype], dict[str, Any]] = {}
-        self.input_shape = self.image_domain.size
-        self.output_shape = (self.detectors.number, len(self.angles))
-
-    def _default_kernel_spec(self) -> OpenCLKernelSpec:
-        kernel_path = Path(__file__).resolve().parent.parent / "fanbeam.cl"
-        return OpenCLKernelSpec.from_path(
-            kernel_path,
-            base_name=self._kernel_base_name,
-        )
-
-    def __getstate__(self) -> dict[str, Any]:
-        """Return pickle/deepcopy state without live OpenCL runtime objects."""
-        state = super().__getstate__()
-        state["_host_struct"] = None
-        state["_device_struct"] = {}
-        return state
+        super().__init__(state=state, kernel_spec=kernel_spec)
+        self._validate_geometry()
 
     @property
     def source_detector_distance(self) -> float:
@@ -520,27 +504,63 @@ class Fanbeam(_OpenCLOperator):
     def source_origin_distance(self) -> float:
         return self.state["source_origin_distance"]
 
-    @property
-    def image_domain(self) -> ImageDomain:
-        return self.state["image_domain"]
+    def _validate_geometry(self) -> None:
+        """Validate immutable fan-beam geometry during construction."""
+        image_extent = self._numeric_image_extent()
+        self._validate_discretization()
+        self._validate_source_geometry(image_extent)
 
-    @property
-    def angles(self) -> Angles:
-        return self.state["angles"]
-
-    @property
-    def detectors(self) -> Detectors:
-        return self.state["detectors"]
-
-    def _validate_numeric_extents(self) -> None:
-        """Reject fan-beam extent placeholders until their geometry is defined."""
-        if isinstance(self.image_domain.extent, ExtentPlaceholder) or isinstance(
-            self.detectors.extent, ExtentPlaceholder
+    def _numeric_image_extent(self) -> float:
+        """Validate fan-beam extents and return the numeric image extent."""
+        image_extent = self.image_domain.extent
+        detector_extent = self.detectors.extent
+        if isinstance(image_extent, ExtentPlaceholder) or isinstance(
+            detector_extent, ExtentPlaceholder
         ):
             raise NotImplementedError(
                 "Fanbeam extent placeholders are not implemented; provide "
                 "numeric image and detector extents."
             )
+        if not np.isfinite(image_extent) or image_extent <= 0:
+            raise ValueError("image extent must be positive and finite")
+        if not np.isfinite(detector_extent) or detector_extent <= 0:
+            raise ValueError("detector extent must be positive and finite")
+        return image_extent
+
+    def _validate_discretization(self) -> None:
+        """Validate fan-beam grid sizes, centers, and angular sampling."""
+        if any(size <= 0 for size in self.image_domain.size):
+            raise ValueError("image dimensions must be positive")
+        if self.detectors.number <= 0:
+            raise ValueError("number of detectors must be positive")
+        if not np.all(np.isfinite(self.image_domain.center)):
+            raise ValueError("image center must be finite")
+        if not np.isfinite(self.detectors.center):
+            raise ValueError("detector center must be finite")
+        if len(self.angles) == 0:
+            raise ValueError("at least one angle is required")
+
+    def _validate_source_geometry(self, image_extent: float) -> None:
+        """Validate source distances and ensure the source stays outside."""
+        source_detector_distance = self.source_detector_distance
+        source_origin_distance = self.source_origin_distance
+        if not np.isfinite(source_origin_distance) or source_origin_distance <= 0:
+            raise ValueError("source_origin_distance must be positive and finite")
+        if (
+            not np.isfinite(source_detector_distance)
+            or source_detector_distance <= source_origin_distance
+        ):
+            raise ValueError(
+                "source_detector_distance must be finite and greater than "
+                "source_origin_distance"
+            )
+
+        Nx, Ny = self.image_domain.size
+        scale = image_extent / max(Nx, Ny)
+        corner_radius = 0.5 * np.hypot(scale * Nx, scale * Ny)
+        center_distance = np.hypot(*self.image_domain.center)
+        if corner_radius + center_distance >= source_origin_distance:
+            raise ValueError("source must lie outside the image domain")
 
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         if self._host_struct is not None:
@@ -565,47 +585,6 @@ class Fanbeam(_OpenCLOperator):
             reverse_detector=self.detectors.reversed,
         )
 
-    def _ensure_device_struct(
-        self,
-        queue: cl.CommandQueue,
-        dtype: npt.DTypeLike,
-    ) -> dict[str, Any]:
-        self._ensure_host_struct(queue)
-        dtype = np.dtype(dtype)
-        cache_key = (queue.context, dtype)
-        if cache_key in self._device_struct:
-            return self._device_struct[cache_key]
-
-        assert self._host_struct is not None
-        ofs = self._host_struct["ofs_dict"][dtype]
-        sdpd = self._host_struct["sdpd_dict"][dtype]
-        geometry = self._host_struct["geo_dict"][dtype]
-
-        ofs_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, ofs.nbytes)
-        sdpd_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, sdpd.nbytes)
-        geometry_buf = cl.Buffer(queue.context, cl.mem_flags.READ_ONLY, geometry.nbytes)
-
-        cl.enqueue_copy(queue, ofs_buf, ofs.data).wait()
-        cl.enqueue_copy(queue, sdpd_buf, sdpd.data).wait()
-        cl.enqueue_copy(queue, geometry_buf, geometry.data).wait()
-
-        device_struct = {
-            "ofs": ofs_buf,
-            "sdpd": sdpd_buf,
-            "geometry": geometry_buf,
-        }
-        self._device_struct[cache_key] = device_struct
-        return device_struct
-
-    def _kernel_arguments(
-        self,
-        output: clarray.Array,
-        argument: clarray.Array,
-        queue: cl.CommandQueue,
-    ) -> tuple[Any, ...]:
-        device_struct = self._ensure_device_struct(queue, argument.dtype)
-        return device_struct["ofs"], device_struct["sdpd"], device_struct["geometry"]
-
 
 class RayDrivenRadon(Radon):
     """Ray-driven parallel-beam projection operator."""
@@ -626,3 +605,7 @@ class RayDrivenFanbeam(Fanbeam):
 
     _operator_name = "RayDrivenFanbeam"
     _kernel_base_name = "fanbeam_ray"
+    _device_array_specs: tuple[tuple[str, str], ...] = (
+        ("ofs", "ofs_dict"),
+        ("geometry", "geo_dict"),
+    )

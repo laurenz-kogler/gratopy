@@ -568,27 +568,22 @@ __kernel void single_line_fanbeam_\my_variable_type_\order1\order2(
 }
 
 // Helper function for ray-driven fanbeam transforms
-real fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(real t,real kappa,
-    real s_under,real s_upper,real difference){
-
-  real rhs=0;
-  real epsilon =0.0001;
-  if ( fabs(difference)<(epsilon*s_under) && (fabs(t)<s_upper*(1+epsilon)))
-  {
-	  rhs=1.;
-	if ((s_upper-fabs(t))<epsilon*s_upper)
-		{rhs=0.5;}
+real fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(
+    real t, real kappa, real s_under, real s_upper, real difference) {
+  real rhs = (real)0.;
+  real epsilon = (real)0.0001;
+  if (fabs(difference) < epsilon * s_under &&
+      fabs(t) < s_upper * ((real)1. + epsilon)) {
+    rhs = (real)1.;
+    if (s_upper - fabs(t) < epsilon * s_upper) {
+      rhs = (real)0.5;
+    }
+  } else if (fabs(t) < s_under) {
+    rhs = (s_upper - s_under) / difference * kappa;
+  } else if (fabs(t) < s_upper) {
+    rhs = (s_upper - fabs(t)) / difference * kappa;
   }
-else if(fabs(t)<s_under)
-  {
-    rhs=(s_upper-s_under)/difference*kappa;
-  }
-  else if(fabs(t)<s_upper)
-  {
-    rhs = (s_upper-fabs(t))/difference*kappa;
-  }
-
-return rhs;
+  return rhs;
 }
 
 // Ray-driven Fanbeam transform
@@ -610,8 +605,6 @@ return rhs;
 //                            Fifth and sixth entries (dx0,dy0) from origin to center of
 //                            detector line (orthogonal projection of origin onto
 //                            detector line).
-//                      sdpd: Buffer containing the values associated with sqrt(xi^2+R^2)
-//                            as weighting
 //     Geometry_information:  Contains various geometric quantities
 //                            relevant for the computation, more precisely
 //                            0. R/delta_x, 1. RE/delta_x, 2. delta_xi/delta_x,
@@ -623,7 +616,7 @@ return rhs;
 //                      fanbeam transform
 __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
     __global real *sino, __global real *img, __constant real8 *ofs,
-    __constant real *sdpd, __constant real *Geometryinformation) {
+    __constant real *Geometryinformation) {
   // Extract geometric information
   size_t Ns = get_global_size(0);
   size_t Na = get_global_size(1);
@@ -640,13 +633,8 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
   real2 midpoint = (real2)(Geometryinformation[3], Geometryinformation[4]);
   real midpoint_det = Geometryinformation[5];
 
-  // Relevant distances
-  real R = Geometryinformation[0];
-  real RE = Geometryinformation[1];
-  real delta_xi = Geometryinformation[2]; // delta_xi / delta_x (so ratio, code
-                                          // runs like delta_x=1)
-  real delta_x =
-      Geometryinformation[10]; // True delta_x, i.e. not rescaled like delta_xi
+  // Physical image pixel width
+  real delta_x = Geometryinformation[10];
 
   // Geometric information associated with a.th angle
   real8 o = ofs[a];
@@ -661,13 +649,11 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
   // compute direction vector from source to detector pixels center.
   real2 dp = d0 + dl * (-midpoint_det + s) - q;
 
-  real norm = hypot(dp.x,dp.y);
+  real norm = hypot(dp.x, dp.y);
+  dp /= norm;
 
-  dp = dp/norm;
-
-  real2 ortho = (real2) (-dp[1], dp[0]);
-
-  real ss = (q.x*ortho.x+q.y*ortho.y)*delta_x;//+(ortho.x*midpoint.x+ortho.y*midpoint.y-midpoint_det)*delta_x; //True parameter s (in universal unit)
+  real2 ortho = (real2)(-dp.y, dp.x);
+  real ss = dot(q, ortho) * delta_x;
 
   // Dummy variable for switching from horizontal to vertical lines
   int Nxx = Nx;
@@ -675,17 +661,17 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
   int horizontal = 1;
 
   // When line is horizontal rather than vertical, switch x and y dimensions
-  if (fabs(ortho.x)< fabs(ortho.y)) {
+  if (fabs(ortho.x) < fabs(ortho.y)) {
     horizontal = 0;
     ortho = (real2)(ortho.y, ortho.x);
 
     Nxx = Ny;
     Nyy = Nx;
 
-    midpoint = (real2) (midpoint.y,midpoint.x);
+    midpoint = (real2)(midpoint.y, midpoint.x);
   }
 
-    // shift image to correct z-dimension (as this will remain fixed),
+  // shift image to correct z-dimension (as this will remain fixed),
   // particularly relevant for "F" contiguity of image
   __global real *img0 = img + pos_img_\order2(0, 0, z, Nx, Ny, Nz);
 
@@ -694,25 +680,27 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
   size_t stride_x = horizontal == 1 ? pos_img_\order2(1, 0, 0, Nx, Ny, Nz)
                                     : pos_img_\order2(0, 1, 0, Nx, Ny, Nz);
 
-  real s_under = fabs ( fabs(ortho.x) - fabs(ortho.y) )/2. * delta_x;
-  real s_upper = fabs ( fabs(ortho.x) + fabs(ortho.y) )/2. * delta_x;
+  real s_under =
+      fabs(fabs(ortho.x) - fabs(ortho.y)) * (real)0.5 * delta_x;
+  real s_upper =
+      (fabs(ortho.x) + fabs(ortho.y)) * (real)0.5 * delta_x;
   real difference = s_upper - s_under;
 
-    // accumulation variable
+  // accumulation variable
   real acc = (real)0.;
 
-    // for through the entire y dimension
-	for (int y = 0; y < Nyy; y++) {
+  // loop through the entire y dimension
+  for (int y = 0; y < Nyy; y++) {
     int x_low, x_high;
 
     // project (0,y) onto detector minus position of detector
-    real d = (y-midpoint.y) *delta_x * ortho.y  - ss;
-
+    real d = (y - midpoint.y) * delta_x * ortho.y - ss;
 
     // compute bounds
-    x_low = (int)((-s_upper*1.01 - d) / ortho.x / delta_x + midpoint.x);
-    x_high = (int)((s_upper*1.01 - d) / ortho.x / delta_x + midpoint.x);
-
+    x_low = (int)((-s_upper * (real)1.01 - d) / ortho.x / delta_x +
+                  midpoint.x);
+    x_high = (int)((s_upper * (real)1.01 - d) / ortho.x / delta_x +
+                   midpoint.x);
 
     // case the direction is decreasing switch high and low
     if (ortho.x < (real)0.) {
@@ -732,21 +720,19 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
     if (horizontal == 0)
       img = img0 + pos_img_\order2(y, x_low, 0, Nx, Ny, Nz);
 
+    // integration in x dimension for fixed y
+    for (int x = x_low; x <= x_high; x++) {
+      // anterpolation weight via normal distance
+      real zz = (x - midpoint.x) * ortho.x * delta_x + d;
+      real weight = fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(
+          zz, (real)1. / fabs(ortho.x), s_under, s_upper, difference);
 
-	  // integration in x dimension for fixed y
-		for (int x = x_low; x <= x_high; x++) {
-		  // anterpolation weight via normal distance
-		  real zz = (x-midpoint.x) * ortho.x *delta_x + d;
-
-		  real weight=0;
-		  weight = fanbeam_ray_weightfkt_\my_variable_type_\order1\order2(zz,1/fabs(ortho.x),s_under,s_upper,difference);
-
-		  if (weight > (real)0.) {
-			acc += weight * img[0];
-		  }
-		  // update image to next position
-		  img += stride_x;
-		}
+      if (weight > (real)0.) {
+        acc += weight * img[0];
+      }
+      // update image to next position
+      img += stride_x;
+    }
   }
   // assign value to sinogram
   sino[pos_sino_\order1(s, a, z, Ns, Na, Nz)] =
@@ -772,8 +758,6 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
 //                            Fifth and sixth entries (dx0,dy0) from origin to center of
 //                            detector line (orthogonal projection of origin onto
 //                            detector line).
-//                      sdpd: Buffer containing the values associated with sqrt(xi^2+R^2)
-//                            as weighting
 //     Geometry_information:  Contains various geometric quantities
 //                            relevant for the computation, more precisely
 //                            0. R/delta_x, 1. RE/delta_x, 2. delta_xi/delta_x,
@@ -785,7 +769,7 @@ __kernel void fanbeam_ray_\my_variable_type_\order1\order2(
 //                      fanbeam backprojection
 __kernel void fanbeam_ray_ad_\my_variable_type_\order1\order2(
     __global real *img, __global real *sino, __constant real8 *ofs,
-    __constant real *sdpd, __constant real *Geometryinformation) {
+    __constant real *Geometryinformation) {
   // Extract geometric information
   size_t Nx = get_global_size(0);
   size_t Ny = get_global_size(1);

@@ -79,8 +79,8 @@ __kernel void radon_\my_variable_type_\order1\order2(
   size_t z = get_global_id(2);
 
   // Extract scales
-  const float delta_x = Geometryinformation[0];
-  const float delta_xi = Geometryinformation[1];
+  const real delta_x = Geometryinformation[0];
+  const real delta_xi = Geometryinformation[1];
 
   // hack (since otherwise s is unsigned which leads to overflow problems)
   int ss = s;
@@ -190,7 +190,7 @@ __kernel void radon_ad_\my_variable_type_\order1\order2(
   const int Ns = Geometryinformation[4];
   const int Na = Geometryinformation[5];
 
-  // Extruct current position
+  // Extract current position
   size_t x = get_global_id(0);
   size_t y = get_global_id(1);
   size_t z = get_global_id(2);
@@ -276,8 +276,8 @@ __kernel void single_line_radon_\my_variable_type_\order1\order2(
   size_t z = 0;
 
   // Discretization parameters
-  const float delta_x = Geometryinformation[0];
-  const float delta_xi = Geometryinformation[1];
+  const real delta_x = Geometryinformation[0];
+  const real delta_xi = Geometryinformation[1];
 
   // hack (since otherwise s is unsigned which leads to overflow problems)
   int ss = s;
@@ -341,27 +341,22 @@ __kernel void single_line_radon_\my_variable_type_\order1\order2(
 }
 
 // Helper function for ray-driven transforms
-real ray_weightfkt_\my_variable_type_\order1\order2(real t,real kappa,
-    real s_under,real s_upper,real difference){
-
-  real rhs=0;
-  real epsilon =0.0001;
-  if ( fabs(difference)<(epsilon*s_under) && (fabs(t)<s_upper*(1+epsilon)))
-  {
-	  rhs=1.;
-	if ((s_upper-fabs(t))<epsilon*s_upper)
-		{rhs=0.5;}
+real ray_weightfkt_\my_variable_type_\order1\order2(
+    real t, real kappa, real s_under, real s_upper, real difference) {
+  real rhs = (real)0.;
+  real epsilon = (real)0.0001;
+  if (fabs(difference) < epsilon * s_under &&
+      fabs(t) < s_upper * ((real)1. + epsilon)) {
+    rhs = (real)1.;
+    if (s_upper - fabs(t) < epsilon * s_upper) {
+      rhs = (real)0.5;
+    }
+  } else if (fabs(t) < s_under) {
+    rhs = (s_upper - s_under) / difference * kappa;
+  } else if (fabs(t) < s_upper) {
+    rhs = (s_upper - fabs(t)) / difference * kappa;
   }
-else if(fabs(t)<s_under)
-  {
-    rhs=(s_upper-s_under)/difference*kappa;
-  }
-  else if(fabs(t)<s_upper)
-  {
-    rhs = (s_upper-fabs(t))/difference*kappa;
-  }
-
-return rhs;
+  return rhs;
 }
 
 // ray-driven Radon Transform
@@ -400,8 +395,8 @@ __kernel void radon_ray_\my_variable_type_\order1\order2(
   size_t z = get_global_id(2);
 
   // Extract scales
-  const float delta_x = Geometryinformation[0];
-  const float delta_xi = Geometryinformation[1];
+  const real delta_x = Geometryinformation[0];
+  const real delta_xi = Geometryinformation[1];
 
   // hack (since otherwise s is unsigned which leads to overflow problems)
   int ss = s;
@@ -410,13 +405,9 @@ __kernel void radon_ray_\my_variable_type_\order1\order2(
   // o = (cos,sin,offset,1/max(|cos|,|sin|))
   real4 o = ofs[a].s0123;
   real reverse_mask = ofs[a].s5;
-  real s_under = fabs ( fabs(o.x) - fabs(o.y) )/2.;
-  real s_upper = fabs ( fabs(o.x) + fabs(o.y) )/2.;
+  real s_under = fabs(fabs(o.x) - fabs(o.y)) * (real)0.5;
+  real s_upper = (fabs(o.x) + fabs(o.y)) * (real)0.5;
   real difference = s_upper - s_under;
- // if ( (a==101))
- // {
- // printf ("Parameters upper=%f , under=%f, difference=%f \n", s_upper,s_under,difference);
- // }
 
   // Dummy variable for switching from horizontal to vertical lines
   int Nxx = Nx;
@@ -477,13 +468,9 @@ __kernel void radon_ray_\my_variable_type_\order1\order2(
       // anterpolation weight via normal distance
       real zz = x * o.x + d;
 
-      real weight=0;
-      weight = ray_weightfkt_\my_variable_type_\order1\order2(zz,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference);
-	  if ( (a==45) && (ss==300))
-	  {
-	  // printf ("Parameters: p=%d, x=%d, y=%d, z=%f, upper=%f , under=%f, difference=%f, weigth=%f \n", ss,x,y, zz,s_upper*delta_xi,s_under*delta_xi,difference*delta_xi, weight);
-	   }
-
+      real weight = ray_weightfkt_\my_variable_type_\order1\order2(
+          zz, fabs(o.w) * delta_x / delta_xi, s_under, s_upper,
+          difference);
 
       if (weight > (real)0.) {
         acc += weight * img[0];
@@ -527,15 +514,15 @@ __kernel void radon_ray_ad_\my_variable_type_\order1\order2(
   const int Ns = Geometryinformation[4];
   const int Na = Geometryinformation[5];
 
-  // Extruct current position
+  // Extract current position
   size_t x = get_global_id(0);
   size_t y = get_global_id(1);
   size_t z = get_global_id(2);
 
 
     // Extract scales
-  const float delta_x = Geometryinformation[0];
-  const float delta_xi = Geometryinformation[1];
+  const real delta_x = Geometryinformation[0];
+  const real delta_xi = Geometryinformation[1];
 
 
   // Accumulation variable
@@ -560,30 +547,28 @@ __kernel void radon_ray_ad_\my_variable_type_\order1\order2(
     // compute detector position associated to (x,y) and phi=a
     real s = dot(c, o.s01) + o.s2;
 
-    // compute adjacent detector positions
-    int sm = floor(s);
-    //int sp = sm + 1;
+    int s_low = floor(s - s_upper * (real)1.01);
+    int s_high = ceil(s + s_upper * (real)1.01);
 
-    int s_low = floor(s-s_upper*1.01);
-    int s_high = ceil(s+s_upper*1.01);
+    s_low = max(s_low, 0);
+    s_high = min(s_high, Ns - 1);
 
-    s_low=max(s_low,0);
-    s_high=min(s_high,Ns-1);
-
-	real acc_local=0;
-	for (int p=s_low;p<=s_high;p++)
-	{
-		real zz = s-p;
-		real weight = ray_weightfkt_\my_variable_type_\order1\order2(zz,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference);
-		acc_local += weight * sino[pos_sino_\order2(p, a, 0, Ns, Na, Nz)];
-	}
+    real acc_local = (real)0.;
+    for (int p = s_low; p <= s_high; p++) {
+      real zz = s - p;
+      real weight = ray_weightfkt_\my_variable_type_\order1\order2(
+          zz, fabs(o.w) * delta_x / delta_xi, s_under, s_upper,
+          difference);
+      acc_local +=
+          weight * sino[pos_sino_\order2(p, a, 0, Ns, Na, Nz)];
+    }
 
     // accumulate weigthed sum (Delta_Phi weight due to angular resolution)
     acc += Delta_phi * acc_local;
   }
 
   // Assign value to img
-  img[pos_img_\order1(x, y, z, Nx, Ny, Nz)] = acc*delta_xi/delta_x;
+  img[pos_img_\order1(x, y, z, Nx, Ny, Nz)] = acc * delta_xi / delta_x;
 }
 
 
@@ -674,12 +659,9 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
   size_t a = get_global_id(1);
   size_t z = get_global_id(2);
 
-
-
-
   // Extract scales
-  const float delta_x = Geometryinformation[0];
-  const float delta_xi = Geometryinformation[1];
+  const real delta_x = Geometryinformation[0];
+  const real delta_xi = Geometryinformation[1];
 
   // hack (since otherwise s is unsigned which leads to overflow problems)
   int ss = s;
@@ -688,11 +670,10 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
   // o = (cos,sin,offset,1/max(|cos|,|sin|))
   real4 o = ofs[a].s0123;
   real reverse_mask = ofs[a].s5;
-  real s_under = fabs ( fabs(o.x) - fabs(o.y) )/2.;
-  real s_upper = fabs ( fabs(o.x) + fabs(o.y) )/2.;
+  real s_under = fabs(fabs(o.x) - fabs(o.y)) * (real)0.5;
+  real s_upper = (fabs(o.x) + fabs(o.y)) * (real)0.5;
   real difference = s_upper - s_under;
-  real inv_difference = 1.0/difference;
-
+  real inv_difference = (real)1. / difference;
 
   // Dummy variable for switching from horizontal to vertical lines
   int Nxx = Nx;
@@ -750,21 +731,15 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
       // anterpolation weight via normal distance
       real zz = x * o.x + d;
 
-      real weight=0;
-      real weight1 = strip_weightfkt_\my_variable_type_\order1\order2(zz-0.5,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference,inv_difference,delta_x/delta_xi);
-      real weight2 = strip_weightfkt_\my_variable_type_\order1\order2(zz+0.5,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference,inv_difference,delta_x/delta_xi);
+      real weight1 = strip_weightfkt_\my_variable_type_\order1\order2(
+          zz - (real)0.5, fabs(o.w) * delta_x / delta_xi, s_under,
+          s_upper, difference, inv_difference, delta_x / delta_xi);
+      real weight2 = strip_weightfkt_\my_variable_type_\order1\order2(
+          zz + (real)0.5, fabs(o.w) * delta_x / delta_xi, s_under,
+          s_upper, difference, inv_difference, delta_x / delta_xi);
+      real weight = weight2 - weight1;
 
-      weight = weight2-weight1;
-
-	  if ( (a==900) && (ss==2000))
-	  {
-	  // printf ("### Weight=%f,\n",  weight);
-	   }
-
-
-      //if (weight > (real)0.) {
-        acc += weight * img[0];
-      //}
+      acc += weight * img[0];
       // update image to next position
       img += stride_x;
     }
@@ -803,9 +778,6 @@ __kernel void radon_strip_\my_variable_type_\order1\order2(
 __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
     __global real *img, __global real *sino, __constant real8 *ofs,
     __constant real *Geometryinformation) {
-
-
-
   // Extract dimensions
   size_t Nx = get_global_size(0);
   size_t Ny = get_global_size(1);
@@ -813,15 +785,15 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
   const int Ns = Geometryinformation[4];
   const int Na = Geometryinformation[5];
 
-  // Extruct current position
+  // Extract current position
   size_t x = get_global_id(0);
   size_t y = get_global_id(1);
   size_t z = get_global_id(2);
 
 
     // Extract scales
-  const float delta_x = Geometryinformation[0];
-  const float delta_xi = Geometryinformation[1];
+  const real delta_x = Geometryinformation[0];
+  const real delta_xi = Geometryinformation[1];
 
 
   // Accumulation variable
@@ -837,19 +809,15 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
     // Extract angular dimensions
     real8 o = ofs[a];
 
-    real s_under = fabs ( fabs(o.x) - fabs(o.y) )/2.;
-    real s_upper = fabs ( fabs(o.x) + fabs(o.y) )/2.;
+    real s_under = fabs(fabs(o.x) - fabs(o.y)) * (real)0.5;
+    real s_upper = (fabs(o.x) + fabs(o.y)) * (real)0.5;
     real difference = s_upper - s_under;
-    real inv_difference = 1.0/difference;
+    real inv_difference = (real)1. / difference;
 
     real Delta_phi = o.s4; // angle_width asociated to the angle
 
     // compute detector position associated to (x,y) and phi=a
     real s = dot(c, o.s01) + o.s2;
-
-    // compute adjacent detector positions
-    //int sm = floor(s);
-    //int sp = sm + 1;
 
     // minimal enclosing integer range (ceil/floor instead of floor/ceil) -> no
     // extra zero-weight detector pixel per side. The +-0.5 is the strip's box
@@ -857,23 +825,22 @@ __kernel void radon_strip_ad_\my_variable_type_\order1\order2(
     int s_low = ceil(s-s_upper*1.01-0.5);
     int s_high = floor(s+s_upper*1.01+0.5);
 
-    s_low=max(s_low,0);
-    s_high=min(s_high,Ns-1);
-   // if ((x==500)&&(y==500))
-   // {printf ("ADSF: %d , %d, %f, %f \n", s_low,s_high,s,s_upper);}
+    s_low = max(s_low, 0);
+    s_high = min(s_high, Ns - 1);
 
-	real acc_local=0;
-	for (int p=s_low;p<=s_high;p++)
-	{
-		real zz = s-p;
-		real weight=0;
-		real weight1 = strip_weightfkt_\my_variable_type_\order1\order2(zz-0.5,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference,inv_difference,delta_x/delta_xi);
-		real weight2 = strip_weightfkt_\my_variable_type_\order1\order2(zz+0.5,fabs(o.w)*delta_x/delta_xi,s_under,s_upper,difference,inv_difference,delta_x/delta_xi);
-
-		weight = weight2-weight1;
-
-		acc_local += weight * sino[pos_sino_\order2(p, a, 0, Ns, Na, Nz)];
-	}
+    real acc_local = (real)0.;
+    for (int p = s_low; p <= s_high; p++) {
+      real zz = s - p;
+      real weight1 = strip_weightfkt_\my_variable_type_\order1\order2(
+          zz - (real)0.5, fabs(o.w) * delta_x / delta_xi, s_under,
+          s_upper, difference, inv_difference, delta_x / delta_xi);
+      real weight2 = strip_weightfkt_\my_variable_type_\order1\order2(
+          zz + (real)0.5, fabs(o.w) * delta_x / delta_xi, s_under,
+          s_upper, difference, inv_difference, delta_x / delta_xi);
+      real weight = weight2 - weight1;
+      acc_local +=
+          weight * sino[pos_sino_\order2(p, a, 0, Ns, Na, Nz)];
+    }
 
 
     // accumulate weigthed sum (Delta_Phi weight due to angular resolution)

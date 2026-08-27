@@ -68,10 +68,14 @@ source-to-origin distances:
 
 .. code-block:: python
 
+    from gratopy.utilities import Detectors
+
     F = gratopy.operator.Fanbeam(
-        source_distances=(8.0, 4.0),
         image_domain=Nx,
         angles=360,
+        detectors=Detectors(number=192, extent=3.0),
+        source_detector_distance=8.0,
+        source_origin_distance=4.0,
     )
     fan_sino = F.apply_to(img, queue=queue)
     fan_backprojection = F.T.apply_to(fan_sino)
