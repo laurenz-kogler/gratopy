@@ -87,11 +87,10 @@ class OpenCLKernelSpec:
     placeholders in the source files, most notably ``\\my_variable_type``,
     ``\\order1``, and ``\\order2``.
 
-    The :attr:`signature` property describes compiled program identity: it
-    depends on the file contents, their order, paths, and build options. The
-    kernel base name is deliberately excluded because it affects lookup but not
-    compilation. Operators selecting different kernels from the same source
-    can therefore share one compiled program.
+    The :attr:`signature` property describes compiled program identity using
+    the source paths, source contents, their order, and build options. Operators
+    with the same compilation inputs share one compiled program, while
+    ``base_name`` selects a kernel family from that program.
 
     **Examples**
     Use the default shipped Radon kernels implicitly via

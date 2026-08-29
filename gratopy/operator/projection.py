@@ -148,11 +148,9 @@ class _ProjectionOperator(_OpenCLOperator):
 class Radon(_ProjectionOperator):
     """Parallel-beam Radon transform operator.
 
-    This class provides the main entry point to gratopy's experimental
-    operator-based projection interface. A :class:`Radon` object represents
-    the forward projection operator. Accessing :attr:`T` creates an adjoint
-    expression wrapper that references the same :class:`Radon` instance and
-    shares its runtime caches.
+    A :class:`Radon` object represents the pixel-driven forward projection.
+    Accessing :attr:`T` creates the corresponding weighted adjoint and shares
+    the geometry and OpenCL runtime caches of the forward operator.
 
     **Parameters**
 
@@ -208,13 +206,11 @@ class Radon(_ProjectionOperator):
     - ``(Ns, Na)`` to ``(Nx, Ny)``,
     - ``(Ns, Na, Nz)`` to ``(Nx, Ny, Nz)``.
 
-    Extent placeholders are supported experimentally for Radon geometry when
-    exactly one extent is fixed numerically and the other is given as
-    :class:`gratopy.utilities.ExtentPlaceholder`. The operator can resolve an
-    image extent from a fixed detector extent, or a detector extent from a
-    fixed image extent. Passing placeholders for both extents at once remains
-    unsupported and raises :class:`NotImplementedError`; geometries for which
-    no valid placeholder resolution exists raise :class:`ValueError`.
+    A numeric image extent can be paired with a detector
+    :class:`gratopy.utilities.ExtentPlaceholder` to infer detector coverage.
+    Conversely, a numeric detector extent can be paired with an image extent
+    placeholder to infer the image domain. ``FULL`` and ``VALID`` select the
+    corresponding coverage convention.
 
     **Examples**
 
@@ -441,18 +437,45 @@ class Radon(_ProjectionOperator):
 
 
 class Fanbeam(_ProjectionOperator):
-    """Fan-beam projection operator.
+    """Pixel-driven fan-beam projection operator.
 
-    ``source_detector_distance`` is the orthogonal distance from source to
-    detector, corresponding to ``R`` in the legacy API.
-    ``source_origin_distance`` is the distance from source to rotation center,
-    corresponding to legacy ``RE``. Both are mandatory keyword-only arguments.
+    **Parameters**
 
-    Fan-beam geometry requires an explicit :class:`Detectors` value because its
-    physical extent cannot be inferred independently of the source geometry.
-    Integer angle counts generate a full-circle uniform sampling. As with
-    :class:`Radon`, :attr:`T` returns an adjoint expression sharing this
-    concrete operator's runtime caches.
+    ``image_domain``:
+        Image grid, physical extent, and center. An integer creates a square
+        image domain; a tuple creates a rectangular domain.
+    ``angles``:
+        Angular sampling. An integer creates a uniformly weighted full-circle
+        sampling; an :class:`gratopy.utilities.Angles` value supplies explicit
+        angles and quadrature weights.
+    ``detectors``:
+        Explicit detector count, physical extent, center, and orientation.
+    ``source_detector_distance``:
+        Orthogonal distance from the source to the detector line.
+    ``source_origin_distance``:
+        Distance from the source to the rotation center. The source lies
+        outside the image domain and this distance is smaller than
+        ``source_detector_distance``.
+    ``kernel_spec``:
+        Optional OpenCL kernel bundle. The bundled pixel-driven Fanbeam kernels
+        are selected by default.
+
+    The operator maps image arrays to sinograms of shape
+    ``(detectors.number, len(angles))`` and applies slicewise to trailing
+    dimensions. :attr:`T` provides the weighted adjoint while sharing geometry
+    and OpenCL runtime caches with the forward operator.
+
+    **Example**
+
+    >>> from gratopy.operator import Fanbeam
+    >>> from gratopy.utilities import Detectors
+    >>> F = Fanbeam(
+    ...     image_domain=128,
+    ...     angles=360,
+    ...     detectors=Detectors(number=192, extent=3.0),
+    ...     source_detector_distance=8.0,
+    ...     source_origin_distance=4.0,
+    ... )
     """
 
     _operator_name = "Fanbeam"
@@ -587,21 +610,21 @@ class Fanbeam(_ProjectionOperator):
 
 
 class RayDrivenRadon(Radon):
-    """Ray-driven parallel-beam projection operator."""
+    """Parallel-beam projection using the ray-driven kernel discretization."""
 
     _operator_name = "RayDrivenRadon"
     _kernel_base_name = "radon_ray"
 
 
 class StripDrivenRadon(Radon):
-    """Strip-driven parallel-beam projection operator."""
+    """Parallel-beam projection using the strip-driven kernel discretization."""
 
     _operator_name = "StripDrivenRadon"
     _kernel_base_name = "radon_strip"
 
 
 class RayDrivenFanbeam(Fanbeam):
-    """Ray-driven fan-beam projection operator."""
+    """Fan-beam projection using the ray-driven kernel discretization."""
 
     _operator_name = "RayDrivenFanbeam"
     _kernel_base_name = "fanbeam_ray"

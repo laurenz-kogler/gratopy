@@ -107,7 +107,7 @@ plt.show()
 ```
 
 ### Experimental operator syntax
-Gratopy also provides an **experimental** operator API with parallel-beam and fan-beam projections. In addition to `gratopy.operator.Radon` and `gratopy.operator.Fanbeam`, it includes ray-driven and strip-driven variants for kernel experimentation. This interface supports operator algebra such as adjoints and compositions, for example `R.T * R`. NumPy inputs require an explicit OpenCL queue on every application; device-array inputs carry their queue and support the shorter `R * image` syntax. As this interface is still experimental, backward-incompatible changes may still occur without a full deprecation cycle.
+Gratopy provides an **experimental** operator API with pixel-, ray-, and strip-driven parallel-beam projections and pixel- and ray-driven fan-beam projections. It supports adjoints and compositions such as `R.T * R`, reusable output arrays, and custom OpenCL kernels. NumPy inputs are applied with an explicit OpenCL queue; device-array inputs carry their queue and support the shorter `R * image` syntax.
 
 ```python
 import numpy as np
