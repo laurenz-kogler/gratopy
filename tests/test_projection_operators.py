@@ -11,7 +11,17 @@ from gratopy.operator import (
     StripDrivenRadon,
 )
 from gratopy.operator.base import AdjointOperator
-from gratopy.utilities import Angles, Detectors, ExtentPlaceholder, ImageDomain
+from gratopy.operator.projection import _ProjectionOperator
+from gratopy.utilities import (
+    Angles,
+    Detectors,
+    ExtentPlaceholder,
+    ImageDomain,
+    full_detector_given_image_fanbeam,
+    full_image_given_detector_fanbeam,
+    valid_detector_given_image_fanbeam,
+    valid_image_given_detector_fanbeam,
+)
 
 
 PARALLEL_OPERATORS = (Radon, RayDrivenRadon, StripDrivenRadon)
@@ -230,18 +240,125 @@ def test_fanbeam_rejects_invalid_source_distances(
         )
 
 
-def test_fanbeam_rejects_extent_placeholders_without_mutating_geometry():
-    image_domain = ImageDomain(size=16, extent=2.0)
-    detectors = Detectors(number=20, extent=ExtentPlaceholder.FULL)
+@pytest.mark.parametrize("operator_class", FANBEAM_OPERATORS)
+@pytest.mark.parametrize(
+    ("placeholder", "expected"),
+    [
+        (
+            ExtentPlaceholder.FULL,
+            full_detector_given_image_fanbeam((0.1, 0.2, -0.1), (2.0, 1.6), 4.0, 8.0),
+        ),
+        (
+            ExtentPlaceholder.VALID,
+            valid_detector_given_image_fanbeam((0.1, 0.2, -0.1), (2.0, 1.6), 4.0, 8.0),
+        ),
+    ],
+)
+def test_fanbeam_resolves_detector_placeholder_without_mutating_geometry(
+    operator_class, placeholder, expected
+):
+    image_domain = ImageDomain(size=(20, 16), extent=2.0, center=(0.2, -0.1))
+    detectors = Detectors(number=20, extent=placeholder, center=0.1)
 
-    with pytest.raises(NotImplementedError, match="numeric image and detector extents"):
+    operator = operator_class(
+        image_domain=image_domain,
+        angles=20,
+        detectors=detectors,
+        source_detector_distance=8.0,
+        source_origin_distance=4.0,
+    )
+
+    assert operator.detectors.extent == pytest.approx(expected)
+    assert operator.image_domain.extent == 2.0
+    assert detectors.extent is placeholder
+
+
+@pytest.mark.parametrize("operator_class", FANBEAM_OPERATORS)
+@pytest.mark.parametrize(
+    ("placeholder", "expected_dimensions"),
+    [
+        (
+            ExtentPlaceholder.FULL,
+            full_image_given_detector_fanbeam((0.1, 0.2, -0.1), 3.0, 6.0, 8.0, 1.25),
+        ),
+        (
+            ExtentPlaceholder.VALID,
+            valid_image_given_detector_fanbeam((0.1, 0.2, -0.1), 3.0, 6.0, 8.0, 1.25),
+        ),
+    ],
+)
+def test_fanbeam_resolves_image_placeholder_without_mutating_geometry(
+    operator_class, placeholder, expected_dimensions
+):
+    image_domain = ImageDomain(size=(20, 16), extent=placeholder, center=(0.2, -0.1))
+    detectors = Detectors(number=20, extent=3.0, center=0.1)
+
+    operator = operator_class(
+        image_domain=image_domain,
+        angles=20,
+        detectors=detectors,
+        source_detector_distance=8.0,
+        source_origin_distance=6.0,
+    )
+
+    assert operator.image_domain.extent == pytest.approx(max(expected_dimensions))
+    assert operator.detectors.extent == 3.0
+    assert image_domain.extent is placeholder
+
+
+def test_fanbeam_placeholder_uses_full_circle_for_half_circle_angles():
+    kwargs = {
+        "image_domain": ImageDomain(size=16, extent=2.0, center=(0.2, -0.1)),
+        "detectors": Detectors(number=20, extent=ExtentPlaceholder.FULL, center=0.1),
+        "source_detector_distance": 8.0,
+        "source_origin_distance": 4.0,
+    }
+
+    half = Fanbeam(angles=Angles.uniform(20, half_circle=True), **kwargs)
+    full = Fanbeam(angles=Angles.uniform(20), **kwargs)
+
+    assert half.detectors.extent == full.detectors.extent
+
+
+def test_fanbeam_rejects_two_extent_placeholders():
+    with pytest.raises(NotImplementedError, match="Both the ImageDomain"):
         Fanbeam(
-            image_domain=image_domain,
+            image_domain=ImageDomain(size=16, extent=ExtentPlaceholder.FULL),
             angles=20,
-            detectors=detectors,
+            detectors=Detectors(number=20, extent=ExtentPlaceholder.FULL),
             source_detector_distance=8.0,
             source_origin_distance=4.0,
         )
 
-    assert image_domain.extent == 2.0
-    assert detectors.extent is ExtentPlaceholder.FULL
+
+def test_fanbeam_reports_placeholder_that_places_source_inside_image():
+    # VALID needs an image meeting all rays hitting the 40.0-wide detector;
+    # those rays pass up to 3.7 from the center, so the image corners reach
+    # beyond the source circle of radius 4.0.
+    with pytest.raises(ValueError, match="resolving the image extent"):
+        Fanbeam(
+            image_domain=ImageDomain(size=16, extent=ExtentPlaceholder.VALID),
+            angles=20,
+            detectors=Detectors(number=20, extent=40.0),
+            source_detector_distance=8.0,
+            source_origin_distance=4.0,
+        )
+
+
+def test_projection_operator_without_formulas_rejects_placeholders():
+    class UnsupportedProjection(_ProjectionOperator):
+        _operator_name = "UnsupportedProjection"
+        _kernel_filename = "radon.cl"
+        _kernel_base_name = "radon"
+
+    operator = UnsupportedProjection(
+        state={
+            "image_domain": ImageDomain(size=16, extent=2.0),
+            "angles": Angles.uniform(20),
+            "detectors": Detectors(number=20, extent=ExtentPlaceholder.FULL),
+        },
+        kernel_spec=None,
+    )
+
+    with pytest.raises(NotImplementedError, match="UnsupportedProjection"):
+        operator._resolve_extent_placeholders()

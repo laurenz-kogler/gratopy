@@ -47,12 +47,16 @@ from gratopy.utilities import (
     Detectors,
     ExtentPlaceholder,
     ImageDomain,
+    full_detector_given_image_fanbeam,
     full_detector_given_image_fullcircle,
     full_detector_given_image_halfcircle,
+    full_image_given_detector_fanbeam,
     full_image_given_detector_fullcircle,
     full_image_given_detector_halfcircle,
+    valid_detector_given_image_fanbeam,
     valid_detector_given_image_fullcircle,
     valid_detector_given_image_halfcircle,
+    valid_image_given_detector_fanbeam,
     valid_image_given_detector_fullcircle,
     valid_image_given_detector_halfcircle,
 )
@@ -111,6 +115,147 @@ class _ProjectionOperator(_OpenCLOperator):
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         """Populate the geometry-specific host structure."""
         raise NotImplementedError
+
+    def _image_extent_formula(
+        self,
+        placeholder: ExtentPlaceholder,
+        M: tuple[float, float, float],
+        detector_extent: float,
+        c: float,
+    ) -> tuple[float, float] | None:
+        """Return the image dimensions ``(Dx, Dy)`` for an image placeholder.
+
+        Geometries supporting extent placeholders override this with their
+        geometry-specific formulas; returning ``None`` signals that no image
+        extent with the requested coverage exists.
+        """
+        raise NotImplementedError(
+            f"{self._operator_name} does not support resolving an "
+            "ExtentPlaceholder for the image domain; provide a numeric extent."
+        )
+
+    def _detector_extent_formula(
+        self,
+        placeholder: ExtentPlaceholder,
+        M: tuple[float, float, float],
+        D: tuple[float, float],
+    ) -> float | None:
+        """Return the detector width for a detector placeholder.
+
+        Geometries supporting extent placeholders override this with their
+        geometry-specific formulas; returning ``None`` signals that no
+        detector width with the requested coverage exists.
+        """
+        raise NotImplementedError(
+            f"{self._operator_name} does not support resolving an "
+            "ExtentPlaceholder for the detectors; provide a numeric extent."
+        )
+
+    def _resolved_image_extent(
+        self,
+        placeholder: ExtentPlaceholder,
+        detector_extent: float,
+    ) -> float:
+        """Compute a numeric image extent from a fixed detector extent."""
+        Mx, My = self.image_domain.center
+        Md = self.detectors.center
+        Nx, Ny = self.image_domain.size
+        c = Nx / Ny
+        M = (Md, Mx, My)
+
+        result = self._image_extent_formula(placeholder, M, detector_extent, c)
+
+        if result is None:
+            if placeholder == ExtentPlaceholder.FULL:
+                meaning = (
+                    "FULL means the largest image extent such that every "
+                    "ray through the image also hits the detector"
+                )
+            else:
+                meaning = (
+                    "VALID means the smallest image extent such that every "
+                    "ray hitting the detector also passes through the image"
+                )
+            raise ValueError(
+                f"Cannot resolve ExtentPlaceholder.{placeholder.name} for the "
+                f"image domain ({meaning}): no such image extent exists with "
+                f"the given detector width Dd={detector_extent}, detector center "
+                f"Md={Md}, and image center ({Mx}, {My}). Consider increasing "
+                f"the detector width or adjusting the center offsets."
+            )
+
+        Dx, Dy = result
+        return max(Dx, Dy)
+
+    def _resolved_detector_extent(
+        self,
+        placeholder: ExtentPlaceholder,
+        image_extent: float,
+    ) -> float:
+        """Compute a numeric detector extent from a fixed image extent."""
+        Mx, My = self.image_domain.center
+        Md = self.detectors.center
+        Nx, Ny = self.image_domain.size
+        Dx = image_extent * Nx / max(Nx, Ny)
+        Dy = image_extent * Ny / max(Nx, Ny)
+        M = (Md, Mx, My)
+        D = (Dx, Dy)
+
+        result = self._detector_extent_formula(placeholder, M, D)
+
+        if result is None:
+            if placeholder == ExtentPlaceholder.FULL:
+                meaning = (
+                    "FULL means the smallest detector width such that every "
+                    "ray through the image also hits the detector"
+                )
+            else:
+                meaning = (
+                    "VALID means the largest detector width such that every "
+                    "ray hitting the detector also passes through the image"
+                )
+            raise ValueError(
+                f"Cannot resolve ExtentPlaceholder.{placeholder.name} for the "
+                f"detector ({meaning}): no such detector width exists with image "
+                f"dimensions ({Dx}, {Dy}), detector center Md={Md}, and image "
+                f"center ({Mx}, {My}). Consider increasing the image extent or "
+                f"adjusting the center offsets."
+            )
+        return result
+
+    def _resolve_extent_placeholders(self) -> None:
+        """Resolve extent placeholders without mutating the input geometry."""
+        image_extent = self.image_domain.extent
+        detector_extent = self.detectors.extent
+        if isinstance(image_extent, ExtentPlaceholder) and isinstance(
+            detector_extent, ExtentPlaceholder
+        ):
+            raise NotImplementedError(
+                "Both the ImageDomain and Detectors use an ExtentPlaceholder. "
+                "Please set at least one of the two extents to a specific "
+                "value; the remaining placeholder will be resolved "
+                "automatically."
+            )
+
+        if isinstance(image_extent, ExtentPlaceholder):
+            assert not isinstance(detector_extent, ExtentPlaceholder)
+            self.state["image_domain"] = replace(
+                self.image_domain,
+                extent=self._resolved_image_extent(
+                    image_extent,
+                    float(detector_extent),
+                ),
+            )
+
+        if isinstance(detector_extent, ExtentPlaceholder):
+            assert not isinstance(image_extent, ExtentPlaceholder)
+            self.state["detectors"] = replace(
+                self.detectors,
+                extent=self._resolved_detector_extent(
+                    detector_extent,
+                    float(image_extent),
+                ),
+            )
 
     def _ensure_device_struct(
         self,
@@ -294,130 +439,36 @@ class Radon(_ProjectionOperator):
             )
         return True
 
-    def _resolved_image_extent(
+    def _image_extent_formula(
         self,
         placeholder: ExtentPlaceholder,
+        M: tuple[float, float, float],
         detector_extent: float,
-    ) -> float:
-        """Compute a numeric image extent from a fixed detector extent."""
-        Mx, My = self.image_domain.center
-        Md = self.detectors.center
-        Nx, Ny = self.image_domain.size
-        c = Nx / Ny
-        M = (Md, Mx, My)
+        c: float,
+    ) -> tuple[float, float] | None:
         full_circle = self._use_full_circle()
-
         if placeholder == ExtentPlaceholder.FULL:
             if full_circle:
-                result = full_image_given_detector_fullcircle(M, detector_extent, c)
-            else:
-                result = full_image_given_detector_halfcircle(M, detector_extent, c)
-        elif full_circle:
-            result = valid_image_given_detector_fullcircle(M, detector_extent, c)
-        else:
-            result = valid_image_given_detector_halfcircle(M, detector_extent, c)
+                return full_image_given_detector_fullcircle(M, detector_extent, c)
+            return full_image_given_detector_halfcircle(M, detector_extent, c)
+        if full_circle:
+            return valid_image_given_detector_fullcircle(M, detector_extent, c)
+        return valid_image_given_detector_halfcircle(M, detector_extent, c)
 
-        if result is None:
-            if placeholder == ExtentPlaceholder.FULL:
-                meaning = (
-                    "FULL means the largest image extent such that every "
-                    "ray through the image also hits the detector"
-                )
-            else:
-                meaning = (
-                    "VALID means the smallest image extent such that every "
-                    "ray hitting the detector also passes through the image"
-                )
-            raise ValueError(
-                f"Cannot resolve ExtentPlaceholder.{placeholder.name} for the "
-                f"image domain ({meaning}): no such image extent exists with "
-                f"the given detector width Dd={detector_extent}, detector center "
-                f"Md={Md}, and image center ({Mx}, {My}). Consider increasing "
-                f"the detector width or adjusting the center offsets."
-            )
-
-        Dx, Dy = result
-        return max(Dx, Dy)
-
-    def _resolved_detector_extent(
+    def _detector_extent_formula(
         self,
         placeholder: ExtentPlaceholder,
-        image_extent: float,
-    ) -> float:
-        """Compute a numeric detector extent from a fixed image extent."""
-        Mx, My = self.image_domain.center
-        Md = self.detectors.center
-        Nx, Ny = self.image_domain.size
-        Dx = image_extent * Nx / max(Nx, Ny)
-        Dy = image_extent * Ny / max(Nx, Ny)
-        M = (Md, Mx, My)
-        D = (Dx, Dy)
+        M: tuple[float, float, float],
+        D: tuple[float, float],
+    ) -> float | None:
         full_circle = self._use_full_circle()
-        result: float | None
-
         if placeholder == ExtentPlaceholder.FULL:
             if full_circle:
-                result = full_detector_given_image_fullcircle(M, D)
-            else:
-                result = full_detector_given_image_halfcircle(M, D)
-        elif full_circle:
-            result = valid_detector_given_image_fullcircle(M, D)
-        else:
-            result = valid_detector_given_image_halfcircle(M, D)
-
-        if result is None:
-            if placeholder == ExtentPlaceholder.FULL:
-                meaning = (
-                    "FULL means the smallest detector width such that every "
-                    "ray through the image also hits the detector"
-                )
-            else:
-                meaning = (
-                    "VALID means the largest detector width such that every "
-                    "ray hitting the detector also passes through the image"
-                )
-            raise ValueError(
-                f"Cannot resolve ExtentPlaceholder.{placeholder.name} for the "
-                f"detector ({meaning}): no such detector width exists with image "
-                f"dimensions ({Dx}, {Dy}), detector center Md={Md}, and image "
-                f"center ({Mx}, {My}). Consider increasing the image extent or "
-                f"adjusting the center offsets."
-            )
-        return result
-
-    def _resolve_extent_placeholders(self) -> None:
-        """Resolve extent placeholders without mutating the input geometry."""
-        image_extent = self.image_domain.extent
-        detector_extent = self.detectors.extent
-        if isinstance(image_extent, ExtentPlaceholder) and isinstance(
-            detector_extent, ExtentPlaceholder
-        ):
-            raise NotImplementedError(
-                "Both the ImageDomain and Detectors use an ExtentPlaceholder. "
-                "Please set at least one of the two extents to a specific "
-                "value; the remaining placeholder will be resolved "
-                "automatically."
-            )
-
-        if isinstance(image_extent, ExtentPlaceholder):
-            assert not isinstance(detector_extent, ExtentPlaceholder)
-            self.state["image_domain"] = replace(
-                self.image_domain,
-                extent=self._resolved_image_extent(
-                    image_extent,
-                    float(detector_extent),
-                ),
-            )
-
-        if isinstance(detector_extent, ExtentPlaceholder):
-            assert not isinstance(image_extent, ExtentPlaceholder)
-            self.state["detectors"] = replace(
-                self.detectors,
-                extent=self._resolved_detector_extent(
-                    detector_extent,
-                    float(image_extent),
-                ),
-            )
+                return full_detector_given_image_fullcircle(M, D)
+            return full_detector_given_image_halfcircle(M, D)
+        if full_circle:
+            return valid_detector_given_image_fullcircle(M, D)
+        return valid_detector_given_image_halfcircle(M, D)
 
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         if self._host_struct is not None:
@@ -465,6 +516,12 @@ class Fanbeam(_ProjectionOperator):
     dimensions. :attr:`T` provides the weighted adjoint while sharing geometry
     and OpenCL runtime caches with the forward operator.
 
+    As for :class:`Radon`, either the image or the detector extent can be a
+    :class:`gratopy.utilities.ExtentPlaceholder`, which is then resolved from
+    the other, numeric extent. Fan-beam placeholders are always resolved with
+    full-circle geometry, independent of the angular sampling; for
+    limited-angle scans, choose numeric extents explicitly.
+
     **Example**
 
     >>> from gratopy.operator import Fanbeam
@@ -504,10 +561,7 @@ class Fanbeam(_ProjectionOperator):
             angles = Angles.uniform(number=angles)
 
         if not isinstance(detectors, Detectors):
-            raise TypeError(
-                "Fanbeam detectors must be an explicit Detectors instance "
-                "with a numeric physical extent."
-            )
+            raise TypeError("Fanbeam detectors must be an explicit Detectors instance.")
 
         state = {
             "source_detector_distance": float(source_detector_distance),
@@ -517,7 +571,10 @@ class Fanbeam(_ProjectionOperator):
             "detectors": detectors,
         }
         super().__init__(state=state, kernel_spec=kernel_spec)
-        self._validate_geometry()
+        self._validate_source_distances()
+        resolved_placeholder = self._placeholder_description()
+        self._resolve_extent_placeholders()
+        self._validate_geometry(resolved_placeholder)
 
     @property
     def source_detector_distance(self) -> float:
@@ -527,23 +584,51 @@ class Fanbeam(_ProjectionOperator):
     def source_origin_distance(self) -> float:
         return self.state["source_origin_distance"]
 
-    def _validate_geometry(self) -> None:
+    def _image_extent_formula(
+        self,
+        placeholder: ExtentPlaceholder,
+        M: tuple[float, float, float],
+        detector_extent: float,
+        c: float,
+    ) -> tuple[float, float] | None:
+        RE = self.source_origin_distance
+        R = self.source_detector_distance
+        if placeholder == ExtentPlaceholder.FULL:
+            return full_image_given_detector_fanbeam(M, detector_extent, RE, R, c)
+        return valid_image_given_detector_fanbeam(M, detector_extent, RE, R, c)
+
+    def _detector_extent_formula(
+        self,
+        placeholder: ExtentPlaceholder,
+        M: tuple[float, float, float],
+        D: tuple[float, float],
+    ) -> float | None:
+        RE = self.source_origin_distance
+        R = self.source_detector_distance
+        if placeholder == ExtentPlaceholder.FULL:
+            return full_detector_given_image_fanbeam(M, D, RE, R)
+        return valid_detector_given_image_fanbeam(M, D, RE, R)
+
+    def _placeholder_description(self) -> str | None:
+        """Describe the extent placeholder in use, for error messages."""
+        if isinstance(self.image_domain.extent, ExtentPlaceholder):
+            return f"image extent ExtentPlaceholder.{self.image_domain.extent.name}"
+        if isinstance(self.detectors.extent, ExtentPlaceholder):
+            return f"detector extent ExtentPlaceholder.{self.detectors.extent.name}"
+        return None
+
+    def _validate_geometry(self, resolved_placeholder: str | None = None) -> None:
         """Validate immutable fan-beam geometry during construction."""
         image_extent = self._numeric_image_extent()
         self._validate_discretization()
-        self._validate_source_geometry(image_extent)
+        self._validate_source_geometry(image_extent, resolved_placeholder)
 
     def _numeric_image_extent(self) -> float:
         """Validate fan-beam extents and return the numeric image extent."""
         image_extent = self.image_domain.extent
         detector_extent = self.detectors.extent
-        if isinstance(image_extent, ExtentPlaceholder) or isinstance(
-            detector_extent, ExtentPlaceholder
-        ):
-            raise NotImplementedError(
-                "Fanbeam extent placeholders are not implemented; provide "
-                "numeric image and detector extents."
-            )
+        assert not isinstance(image_extent, ExtentPlaceholder)
+        assert not isinstance(detector_extent, ExtentPlaceholder)
         if not np.isfinite(image_extent) or image_extent <= 0:
             raise ValueError("image extent must be positive and finite")
         if not np.isfinite(detector_extent) or detector_extent <= 0:
@@ -563,8 +648,8 @@ class Fanbeam(_ProjectionOperator):
         if len(self.angles) == 0:
             raise ValueError("at least one angle is required")
 
-    def _validate_source_geometry(self, image_extent: float) -> None:
-        """Validate source distances and ensure the source stays outside."""
+    def _validate_source_distances(self) -> None:
+        """Validate the source distances used by the placeholder formulas."""
         source_detector_distance = self.source_detector_distance
         source_origin_distance = self.source_origin_distance
         if not np.isfinite(source_origin_distance) or source_origin_distance <= 0:
@@ -578,12 +663,27 @@ class Fanbeam(_ProjectionOperator):
                 "source_origin_distance"
             )
 
+    def _validate_source_geometry(
+        self,
+        image_extent: float,
+        resolved_placeholder: str | None = None,
+    ) -> None:
+        """Ensure the source stays outside the image domain."""
         Nx, Ny = self.image_domain.size
         scale = image_extent / max(Nx, Ny)
         corner_radius = 0.5 * np.hypot(scale * Nx, scale * Ny)
         center_distance = np.hypot(*self.image_domain.center)
-        if corner_radius + center_distance >= source_origin_distance:
-            raise ValueError("source must lie outside the image domain")
+        if corner_radius + center_distance >= self.source_origin_distance:
+            message = "source must lie outside the image domain"
+            if resolved_placeholder is not None:
+                message += (
+                    f"; resolving the {resolved_placeholder} gave image extent "
+                    f"{image_extent} and detector extent {self.detectors.extent}, "
+                    "which places the source inside the image domain. Consider "
+                    "a smaller detector extent, a larger source_origin_distance, "
+                    "or numeric extents."
+                )
+            raise ValueError(message)
 
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         if self._host_struct is not None:
