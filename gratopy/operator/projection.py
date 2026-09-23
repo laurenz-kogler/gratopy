@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from gratopy.gratopy import fanbeam_struct, radon_struct
+from gratopy.operator.geometry import ProjectionGeometry
 from gratopy.operator.opencl import OpenCLKernelSpec, _OpenCLOperator
 from gratopy.utilities import (
     Angles,
@@ -115,6 +116,96 @@ class _ProjectionOperator(_OpenCLOperator):
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         """Populate the geometry-specific host structure."""
         raise NotImplementedError
+
+    def _geometry_at(self, angles: npt.ArrayLike | None = None) -> ProjectionGeometry:
+        """Return the physical geometry of the operator at the given angles.
+
+        :param angles: Angles in radians. Defaults to all angles of the
+            operator's angular sampling.
+        :return: The source, detector and image-domain positions, see
+            :class:`gratopy.operator.geometry.ProjectionGeometry`.
+        """
+        if angles is None:
+            angles = self.angles.angles
+        angles = np.atleast_1d(np.asarray(angles, dtype=float))
+        image_extent = self.image_domain.extent
+        detector_extent = self.detectors.extent
+        assert not isinstance(image_extent, ExtentPlaceholder)
+        assert not isinstance(detector_extent, ExtentPlaceholder)
+
+        Nx, Ny = self.image_domain.size
+        image_dims = np.array([Nx, Ny], dtype=float) * image_extent / max(Nx, Ny)
+        beam = self._beam_geometry(angles, image_dims)
+        return ProjectionGeometry(
+            angles=angles,
+            image_center=np.array(self.image_domain.center, dtype=float),
+            image_dims=image_dims,
+            detector_center=float(self.detectors.center),
+            detector_width=float(detector_extent),
+            detector_number=self.detectors.number,
+            **beam,
+        )
+
+    def show_geometry(
+        self,
+        angles: npt.ArrayLike | None = None,
+        ax: Any = None,
+        *,
+        n_rays: int = 15,
+        coverage: bool = True,
+        trajectory: bool = True,
+        legend: bool = True,
+    ) -> Any:
+        """Draw the physical geometry of the operator.
+
+        The drawing shows the image domain, the detector (with an arrow
+        towards increasing pixel indices, pixel 0 and the detector center),
+        sample rays over the detector and, for fan beams, the source. With
+        ``coverage``, the illuminated region is shaded and rays missing the
+        image domain are drawn dashed in red, which makes the
+        :class:`~gratopy.utilities.ExtentPlaceholder` conventions visible.
+
+        :param angles: Angle or angles in radians; several angles are overlaid
+            in one axes. Defaults to the first angle of the operator.
+        :param ax: :class:`matplotlib.axes.Axes` to draw into. Existing
+            content is kept. If ``None``, a new figure is created; call
+            :func:`matplotlib.pyplot.show` to display it.
+        :param n_rays: Number of sample rays per angle.
+        :param coverage: Whether to highlight the coverage of the image.
+        :param trajectory: For fan beams, whether to draw the source circle
+            with the source positions of all operator angles.
+        :param legend: Whether to add a legend to the right of the axes, e.g.
+            ``False`` when drawing a grid of geometries.
+        :return: The :class:`matplotlib.axes.Axes` drawn into.
+        """
+        from gratopy.operator.geometry import plot_projection_geometry
+
+        if angles is None:
+            angles = self.angles.angles[:1]
+        geometry = self._geometry_at(angles)
+        return plot_projection_geometry(
+            geometry,
+            ax,
+            n_rays=n_rays,
+            coverage=coverage,
+            trajectory=(
+                self._geometry_at().sources if trajectory and geometry.is_fanbeam else None
+            ),
+            legend=legend,
+            title=self._operator_name if ax is None else None,
+        )
+
+    def _beam_geometry(
+        self, angles: np.ndarray, image_dims: np.ndarray
+    ) -> dict[str, Any]:
+        """Return the geometry-specific fields of :class:`ProjectionGeometry`.
+
+        Geometries override this to provide ``detector_origin``,
+        ``detector_axis`` and either ``sources`` or ``beam_direction``.
+        """
+        raise NotImplementedError(
+            f"{self._operator_name} does not describe its physical geometry."
+        )
 
     def _image_extent_formula(
         self,
@@ -470,6 +561,24 @@ class Radon(_ProjectionOperator):
             return valid_detector_given_image_fullcircle(M, D)
         return valid_detector_given_image_halfcircle(M, D)
 
+    def _beam_geometry(
+        self, angles: np.ndarray, image_dims: np.ndarray
+    ) -> dict[str, Any]:
+        # The parallel-beam detector can lie at any distance along the beam;
+        # place it just outside the scene so that drawings stay compact.
+        scene_radius = max(
+            np.hypot(*self.image_domain.center) + np.hypot(*image_dims) / 2,
+            abs(self.detectors.center) + float(self.detectors.extent) / 2,  # type: ignore[arg-type]
+        )
+        beam_direction = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        # radon_struct has no detector reversal, so neither has the geometry.
+        detector_axis = np.stack([np.sin(angles), -np.cos(angles)], axis=1)
+        return {
+            "detector_origin": 1.1 * scene_radius * beam_direction,
+            "detector_axis": detector_axis,
+            "beam_direction": beam_direction,
+        }
+
     def _ensure_host_struct(self, queue: cl.CommandQueue) -> None:
         if self._host_struct is not None:
             return
@@ -608,6 +717,20 @@ class Fanbeam(_ProjectionOperator):
         if placeholder == ExtentPlaceholder.FULL:
             return full_detector_given_image_fanbeam(M, D, RE, R)
         return valid_detector_given_image_fanbeam(M, D, RE, R)
+
+    def _beam_geometry(
+        self, angles: np.ndarray, image_dims: np.ndarray
+    ) -> dict[str, Any]:
+        RE = self.source_origin_distance
+        R = self.source_detector_distance
+        towards_detector = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        orientation = -1.0 if self.detectors.reversed else 1.0
+        detector_axis = orientation * np.stack([np.sin(angles), -np.cos(angles)], axis=1)
+        return {
+            "detector_origin": (R - RE) * towards_detector,
+            "detector_axis": detector_axis,
+            "sources": -RE * towards_detector,
+        }
 
     def _placeholder_description(self) -> str | None:
         """Describe the extent placeholder in use, for error messages."""
